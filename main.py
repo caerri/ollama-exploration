@@ -14,7 +14,7 @@ DIM = "\033[2m"
 BOLD = "\033[1m"
 RESET = "\033[0m"
 CYAN = "\033[36m"
-GREEN = "\033[32m"
+GREEN = "\033[38;5;115m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 MAGENTA = "\033[35m"
@@ -52,7 +52,8 @@ You MUST always respond with a valid JSON object — no other text, no markdown,
   "sensitive_data": "YES or NO",
   "next_step": "RESPOND_LOCALLY or SEND_TO_REMOTE or ASK_USER",
   "model": "HAIKU or SONNET or OPUS or NONE",
-  "output": "your response, a detailed prompt for the remote model, or a clarifying question"
+  "output": "your response, a detailed prompt for the remote model, or a clarifying question",
+  "context_summary": "brief summary of relevant conversation context for the remote model, or empty string if not needed"
 }
 
 --- ROUTING RULES ---
@@ -79,6 +80,8 @@ SEND_TO_REMOTE — ONLY when you genuinely cannot do the job:
 - Large/complex code projects (full applications, not snippets)
 - Tasks where you've tried locally and your answer is clearly inadequate
 - You do NOT have internet access. If the answer depends on what's happening NOW, send it out.
+- NOTE: SEND_TO_REMOTE is a SUGGESTION. The user will be asked to confirm before the call is made ("Phone a Friend"). They can say no. So make sure your output field contains a good prompt, but also be prepared to answer locally if the user declines.
+- When suggesting SEND_TO_REMOTE with conversation history that matters, fill in context_summary with a brief recap so the remote model has enough context. Keep it under 200 words. Leave it as "" for simple standalone questions.
 
 CRITICAL — WHEN THE USER COMPLAINS ABOUT ROUTING:
 If the user expresses frustration about unnecessary API calls — this is feedback. Do NOT send another remote call. Acknowledge it, answer locally, and adjust.
@@ -97,10 +100,11 @@ THE OUTPUT IS NOT YOUR ANSWER — it's an INSTRUCTION to the remote model.
 - RIGHT: "Explain what LangChain is in 5 sentences." (instruction for remote)
 
 --- MODEL SELECTION (only when SEND_TO_REMOTE) ---
-HAIKU ($1/$5 MTok, data: April 2024) — default for pre-2024 lookups, simple Q&A
-SONNET ($3/$15 MTok, data: Jan 2026) — code, analysis, anything recent (2024-2026)
-OPUS ($5/$25 MTok) — complex reasoning only, use sparingly
+HAIKU (cheap, fast) — YOUR DEFAULT. Use for most remote calls. Handles: factual Q&A, summaries, explanations, lookups, translations, short writing, light code questions. ALWAYS pick HAIKU unless you have a clear reason to step up.
+SONNET (moderate) — Only when Haiku won't cut it. Good at: complex code generation, multi-step reasoning, detailed technical analysis, long-form writing. Do NOT pick Sonnet just because a question feels "important."
+OPUS (expensive) — Rarely needed. Very complex multi-part reasoning, research-grade analysis. Almost never pick this.
 Set model to "NONE" when not sending to remote.
+RULE: When in doubt, ALWAYS pick HAIKU.
 
 --- OTHER RULES ---
 sensitive_data: "YES" if message has passwords, API keys, SSNs, personal identifiers. Strip them with [REDACTED].
@@ -271,6 +275,7 @@ def parse_local_response(raw_text: str) -> dict[str, str]:
         "next_step": "NEXT_STEP",
         "model": "MODEL",
         "output": "OUTPUT",
+        "context_summary": "CONTEXT_SUMMARY",
     }
     for json_key, field_key in key_map.items():
         value = data.get(json_key, data.get(field_key, ""))
@@ -304,7 +309,52 @@ def print_local_summary(parsed: dict[str, str]) -> None:
         print()
 
 
-def relay_once(user_input: str) -> None:
+COST_INFO = {
+    "HAIKU": "cheap",
+    "SONNET": "moderate",
+    "OPUS": "expensive",
+}
+
+
+def build_conversation_digest(max_turns: int = 10) -> str:
+    """Build a plain-text digest of the recent conversation for the remote model.
+
+    The local model's context_summary field is often too vague ("User wants
+    advice...") so Python constructs a real digest from conversation_history.
+    This way the remote model sees what the user actually said.
+    """
+    if not conversation_history:
+        return ""
+
+    # Grab the last N entries (user + assistant pairs)
+    recent = conversation_history[-max_turns * 2:]
+    lines: list[str] = []
+    for msg in recent:
+        role = msg["role"]
+        content = msg["content"]
+        # Skip the local model's raw JSON — it's not useful context for the remote model
+        # Instead, look for remote responses injected into history
+        if role == "assistant":
+            if content.startswith("[Remote model"):
+                lines.append(f"Remote model: {content}")
+            else:
+                # Try to extract just the output field from local JSON
+                try:
+                    parsed = json.loads(content)
+                    local_answer = parsed.get("output", "")
+                    if local_answer and parsed.get("next_step", "").upper() == "RESPOND_LOCALLY":
+                        lines.append(f"Local model: {local_answer}")
+                except (json.JSONDecodeError, AttributeError):
+                    pass  # skip unparseable assistant turns
+        elif role == "user":
+            lines.append(f"User: {content}")
+
+    if not lines:
+        return ""
+    return "--- Conversation so far ---\n" + "\n".join(lines) + "\n--- End of conversation ---"
+
+
+def relay_once(user_input: str, force_remote: bool = False) -> None:
     print(f"\n{CYAN}--- Local model ---{RESET}")
     local_raw = call_ollama(user_input, show_stream=True)
 
@@ -330,6 +380,29 @@ def relay_once(user_input: str) -> None:
         if parsed["NEXT_STEP"].upper() == "SEND_TO_REMOTE":
             parsed["NEXT_STEP"] = "RESPOND_LOCALLY"
             print(f"  {YELLOW}[OVERRIDE] User asked to stop remote calls — forcing local{RESET}")
+
+    # If user explicitly requested remote, override local routing
+    if force_remote and parsed["NEXT_STEP"].upper() != "SEND_TO_REMOTE":
+        parsed["NEXT_STEP"] = "SEND_TO_REMOTE"
+        if not parsed.get("MODEL") or parsed["MODEL"].upper() == "NONE":
+            parsed["MODEL"] = "HAIKU"
+        # If the local model answered instead of writing a prompt, ask it to rewrite
+        rewrite_prompt = (f"The user explicitly asked to phone a friend (use the remote model). "
+                          f"Their original message was: \"{user_input}\"\n"
+                          f"Write a CLEAR INSTRUCTION for the remote model. "
+                          f"Do NOT answer the question yourself. "
+                          f"Include relevant conversation context if needed. "
+                          f"Set next_step to SEND_TO_REMOTE.")
+        rewrite_raw = call_ollama(rewrite_prompt)
+        try:
+            rewrite_parsed = parse_local_response(rewrite_raw)
+            parsed["OUTPUT"] = rewrite_parsed["OUTPUT"]
+            parsed["CONTEXT_SUMMARY"] = rewrite_parsed.get("CONTEXT_SUMMARY", "")
+            if rewrite_parsed.get("MODEL", "NONE").upper() != "NONE":
+                parsed["MODEL"] = rewrite_parsed["MODEL"]
+        except (ValueError, json.JSONDecodeError):
+            pass  # keep original output as fallback
+
     print_local_summary(parsed)
 
     next_step = parsed["NEXT_STEP"].upper().strip()
@@ -417,12 +490,69 @@ def relay_once(user_input: str) -> None:
         model_choice = parsed.get("MODEL", "HAIKU").upper().strip()
         model_id = MODEL_MAP.get(model_choice, MODEL_MAP["HAIKU"])
         remote_prompt = parsed["OUTPUT"]
+        context_summary = parsed.get("CONTEXT_SUMMARY", "")
+        cost = COST_INFO.get(model_choice, "unknown cost")
+
+        # --- Phone a Friend confirmation gate ---
+        if not force_remote:
+            print(f"\n{MAGENTA}📞 Phone a Friend?{RESET}  ({model_choice} — {cost})")
+            preview = remote_prompt[:200] + ("..." if len(remote_prompt) > 200 else "")
+            print(f'{DIM}   "{preview}"{RESET}')
+            choice = input(f"   {BOLD}[y]{RESET} Send / {BOLD}[n]{RESET} Answer locally / {BOLD}[more]{RESET} Need more context > ").strip().lower()
+
+            if choice in ("n", "no"):
+                # Ask local model to answer it instead
+                local_retry_prompt = (f"The user asked: \"{user_input}\"\n"
+                                      f"You suggested sending this to the remote model, but the user "
+                                      f"declined. Answer the question yourself to the best of your ability. "
+                                      f"Set next_step to RESPOND_LOCALLY.")
+                print(f"\n{CYAN}--- Local model (retry) ---{RESET}")
+                retry_raw = call_ollama(local_retry_prompt, show_stream=True)
+                try:
+                    retry_parsed = parse_local_response(retry_raw)
+                    print(f"\n{BOLD}{retry_parsed['OUTPUT']}{RESET}")
+                except (ValueError, json.JSONDecodeError):
+                    print(f"\n{YELLOW}[NOTE] Couldn't parse retry — here's the raw response{RESET}")
+                    print(retry_raw)
+                return
+
+            if choice in ("more", "m"):
+                # Ask local model to generate a clarifying question
+                clarify_prompt = (f"The user asked: \"{user_input}\"\n"
+                                  f"You wanted to send this to the remote model, but the user wants "
+                                  f"more context first. Ask the user a clarifying question that would "
+                                  f"help you either answer locally or build a better remote prompt. "
+                                  f"Set next_step to ASK_USER.")
+                clarify_raw = call_ollama(clarify_prompt)
+                try:
+                    clarify_parsed = parse_local_response(clarify_raw)
+                    print(f"\n{YELLOW}{clarify_parsed['OUTPUT']}{RESET}")
+                except (ValueError, json.JSONDecodeError):
+                    print(f"\n{YELLOW}What additional context would help here?{RESET}")
+                return
+
+            if choice not in ("y", "yes"):
+                # Empty Enter or unrecognized input — don't send, treat as cancel
+                print(f"{DIM}[Cancelled — press y to send]{RESET}")
+                return
+
+        # Build the full remote prompt with real conversation context
+        # Python builds this from actual history — not relying on the local
+        # model's often-vague context_summary field
+        digest = build_conversation_digest()
+        parts: list[str] = []
+        if digest:
+            parts.append(digest)
+        if context_summary:
+            parts.append(f"Local model's note: {context_summary}")
+        parts.append(remote_prompt)
+        full_remote_prompt = "\n\n".join(parts)
 
         print(f"\n{MAGENTA}--- Remote model ({model_choice}) ---{RESET}")
-        print(f"{DIM}[Sending {len(remote_prompt)} chars to {model_id}]{RESET}")
+        print(f"{DIM}[Sending {len(full_remote_prompt)} chars to {model_id}]{RESET}")
         print(f"{DIM}[PROMPT]: {remote_prompt}{RESET}")
         print()
-        remote_response = call_anthropic_stream(remote_prompt, model=model_id)
+        remote_response = call_anthropic_stream(full_remote_prompt, model=model_id)
 
         # Auto-escalate: if Haiku says it doesn't know, retry with Sonnet
         dont_know_phrases = [
@@ -439,21 +569,21 @@ def relay_once(user_input: str) -> None:
             "cannot provide",
             "i don't have",
         ]
-        # Normalize smart quotes to ASCII before matching
         normalized_response = remote_response.lower().replace("\u2019", "'").replace("\u2018", "'")
         if model_choice == "HAIKU" and any(phrase in normalized_response for phrase in dont_know_phrases):
-            print(f"\n{YELLOW}[AUTO-ESCALATE] Haiku doesn't know this — retrying with Sonnet...{RESET}")
-            sonnet_id = MODEL_MAP["SONNET"]
-            remote_response = call_anthropic_stream(remote_prompt, model=sonnet_id)
-            print(f"\n{MAGENTA}--- Escalated to SONNET ({sonnet_id}) ---{RESET}")
+            escalate = input(f"\n{YELLOW}Haiku couldn't answer. Escalate to SONNET (moderate cost)? [y/n] > {RESET}").strip().lower()
+            if escalate in ("y", "yes"):
+                sonnet_id = MODEL_MAP["SONNET"]
+                print(f"\n{MAGENTA}--- Escalating to SONNET ({sonnet_id}) ---{RESET}")
+                remote_response = call_anthropic_stream(full_remote_prompt, model=sonnet_id)
+            else:
+                print(f"{DIM}[Keeping Haiku response]{RESET}")
 
         # Inject Claude's response into Ollama's conversation history
-        # so the local model knows what was said and can reference it
         conversation_history.append({
             "role": "assistant",
             "content": f"[Remote model ({model_choice}) responded]: {remote_response}"
         })
-        # Keep history manageable
         if len(conversation_history) > 20:
             conversation_history[:] = conversation_history[-20:]
 
@@ -464,7 +594,8 @@ def relay_once(user_input: str) -> None:
 
 def main() -> None:
     print(f"{BOLD}{CYAN}Relay v2: Local (Ollama) → Remote (Claude){RESET}")
-    print(f"{DIM}Commands: 'exit' to quit, 'clear' to reset conversation{RESET}\n")
+    print(f"{DIM}Commands: 'exit' to quit, 'clear' to reset conversation{RESET}")
+    print(f"{DIM}Say 'phone a friend' or '!remote' to force a remote call{RESET}\n")
 
     while True:
         # Flush any leftover bytes in stdin (e.g. from a multi-line paste)
@@ -482,8 +613,21 @@ def main() -> None:
             print(f"{CYAN}[Conversation cleared]{RESET}")
             continue
 
+        # Detect explicit remote triggers
+        force_remote = False
+        lower_input = user_input.lower()
+        for trigger in ["phone a friend", "!remote"]:
+            if trigger in lower_input:
+                force_remote = True
+                # Strip the trigger phrase so the local model gets a clean question
+                user_input = user_input[:lower_input.index(trigger)] + user_input[lower_input.index(trigger) + len(trigger):]
+                user_input = user_input.strip()
+                if not user_input:
+                    user_input = "The user wants to phone a friend but didn't specify a question. Ask them what they'd like to send to the remote model."
+                break
+
         try:
-            relay_once(user_input)
+            relay_once(user_input, force_remote=force_remote)
         except (requests.RequestException, ValueError) as err:
             print(f"{RED}[ERROR] {err}{RESET}")
         except Exception as err:  # noqa: BLE001
