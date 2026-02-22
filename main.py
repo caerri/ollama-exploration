@@ -6,6 +6,7 @@ import termios
 from dotenv import load_dotenv
 import requests
 from anthropic import Anthropic
+from openai import OpenAI
 
 load_dotenv()
 
@@ -18,6 +19,7 @@ GREEN = "\033[38;5;115m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 MAGENTA = "\033[35m"
+BLUE = "\033[38;5;111m"
 
 
 LOCAL_SYSTEM_PROMPT = """You are the local AI in a relay system. You talk to a real human. Be natural, friendly, and conversational.
@@ -39,11 +41,11 @@ RESPONSE QUALITY:
 - Think "helpful coworker explaining something at a whiteboard" — not "dictionary definition."
 - Aim for 3-8 sentences for most answers. One-sentence answers are almost never enough unless the question is truly trivial (like "what's 2+2").
 
-This is a 3-WAY CONVERSATION: the user, you (local model), and a remote Claude model. When you send a request to the remote model, its response will appear in the conversation history as "[Remote model (MODEL) responded]: ...". You can see and reference what Claude said. Use this context:
-- If the user asks a follow-up about something Claude answered, you have that answer in your history — use it
-- Don't re-send questions to the remote model if the answer is already in the conversation
-- If Claude already answered well, just summarize or reference it locally instead of making another API call
-- You are the user's primary interface — Claude is a resource you call on when needed, not the default
+This is a MULTI-MODEL CONVERSATION: the user, you (local model), and remote models (Claude from Anthropic, GPT from OpenAI). When you send a request to a remote model, its response will appear in the conversation history as "[Remote model (MODEL) responded]: ...". You can see and reference what any remote model said. Use this context:
+- If the user asks a follow-up about something a remote model answered, you have that answer in your history — use it
+- Don't re-send questions to a remote model if the answer is already in the conversation
+- If a remote model already answered well, just summarize or reference it locally instead of making another API call
+- You are the user's primary interface — remote models are resources you call on when needed, not the default
 
 You MUST always respond with a valid JSON object — no other text, no markdown, no explanation outside the JSON. The JSON must have exactly these keys:
 
@@ -51,7 +53,7 @@ You MUST always respond with a valid JSON object — no other text, no markdown,
   "analysis": "one sentence — what is the user asking or doing?",
   "sensitive_data": "YES or NO",
   "next_step": "RESPOND_LOCALLY or SEND_TO_REMOTE or ASK_USER",
-  "model": "HAIKU or SONNET or OPUS or NONE",
+  "model": "HAIKU or SONNET or OPUS or GPT_MINI or GPT or GPT_PRO or NONE",
   "output": "your response, a detailed prompt for the remote model, or a clarifying question",
   "context_summary": "brief summary of relevant conversation context for the remote model, or empty string if not needed"
 }
@@ -100,11 +102,26 @@ THE OUTPUT IS NOT YOUR ANSWER — it's an INSTRUCTION to the remote model.
 - RIGHT: "Explain what LangChain is in 5 sentences." (instruction for remote)
 
 --- MODEL SELECTION (only when SEND_TO_REMOTE) ---
-HAIKU (cheap, fast) — YOUR DEFAULT. Use for most remote calls. Handles: factual Q&A, summaries, explanations, lookups, translations, short writing, light code questions. ALWAYS pick HAIKU unless you have a clear reason to step up.
-SONNET (moderate) — Only when Haiku won't cut it. Good at: complex code generation, multi-step reasoning, detailed technical analysis, long-form writing. Do NOT pick Sonnet just because a question feels "important."
-OPUS (expensive) — Rarely needed. Very complex multi-part reasoning, research-grade analysis. Almost never pick this.
+You have TWO providers: Anthropic (Claude) and OpenAI (GPT). Pick the right model for the task.
+
+ANTHROPIC (Claude) — best for: technical tasks, code, analysis, structured reasoning
+  HAIKU (cheap, fast) — YOUR DEFAULT for most remote calls. Factual Q&A, summaries, explanations, lookups, light code.
+  SONNET (moderate) — Complex code generation, multi-step reasoning, detailed technical analysis. Don't pick just because it feels "important."
+  OPUS (expensive) — NEVER select this unless the user explicitly says "use opus". No exceptions. If you think a task needs Opus, use SONNET instead.
+
+OPENAI (GPT) — best for: creative writing, brainstorming, ideation, open-ended exploration, storytelling
+  GPT_MINI (cheap, fast) — DEFAULT when using GPT. Good at: brainstorming, creative writing, generating ideas, casual writing tasks, summarizing with flair.
+  GPT (moderate) — Stronger coding and agentic tasks, longer and more polished writing, when GPT_MINI isn't cutting it.
+  GPT_PRO (very expensive) — NEVER select this unless the user explicitly says "use gpt pro". No exceptions. If you think a task needs GPT_PRO, use GPT instead.
+
+WHEN TO PICK CLAUDE vs GPT:
+- Code, debugging, technical docs → Claude (HAIKU or SONNET)
+- Creative writing, brainstorming, ideation, storytelling → GPT (GPT_MINI or GPT)
+- Factual Q&A, lookups → either, prefer HAIKU (cheapest)
+- If the user asks for a specific provider, use it
+
 Set model to "NONE" when not sending to remote.
-RULE: When in doubt, ALWAYS pick HAIKU.
+RULE: When in doubt, ALWAYS pick HAIKU or GPT_MINI (whichever fits the task type).
 
 --- OTHER RULES ---
 sensitive_data: "YES" if message has passwords, API keys, SSNs, personal identifiers. Strip them with [REDACTED].
@@ -116,8 +133,10 @@ Tone: warm, helpful coworker. Substantive but not robotic.
 "how do gallstones form" → RESPOND_LOCALLY (established medical knowledge)
 "write a palindrome checker in python" → RESPOND_LOCALLY (you know this)
 "who is the president right now" → SEND_TO_REMOTE/HAIKU (current events)
-"tell me about 28 years later movie" → SEND_TO_REMOTE/SONNET (you don't recognize it = post-cutoff)
-"what are the latest langchain updates" → SEND_TO_REMOTE/SONNET (recent changes)
+"tell me about 28 years later movie" → SEND_TO_REMOTE/HAIKU (you don't recognize it = post-cutoff, just a lookup)
+"what are the latest langchain updates" → SEND_TO_REMOTE/SONNET (recent + technical)
+"brainstorm 10 names for my startup" → SEND_TO_REMOTE/GPT_MINI (creative brainstorming)
+"write me a short story about a robot" → SEND_TO_REMOTE/GPT_MINI (creative writing)
 "build me an app" → ASK_USER (too vague)
 "my mother's maiden name is poop" → RESPOND_LOCALLY, sensitive_data: YES, [REDACTED]
 """
@@ -197,6 +216,68 @@ def call_ollama(prompt: str, show_stream: bool = False) -> str:
     return assistant_content
 
 
+def call_ollama_direct(prompt: str, model: str | None = None, show_stream: bool = False) -> str:
+    """Call a specific Ollama model directly — no JSON format, no routing,
+    no conversation history injection.  Used for local escalation (e.g. deepseek)."""
+    base_url = get_env("OLLAMA_BASE_URL", "http://localhost:11434")
+    if not model:
+        model = get_env("OLLAMA_ESCALATION_MODEL", "")
+    if not model:
+        return ""  # no escalation model configured
+    url = f"{base_url.rstrip('/')}/api/chat"
+
+    messages = [{"role": "user", "content": prompt}]
+
+    try:
+        response = requests.post(
+            url,
+            json={
+                "model": model,
+                "messages": messages,
+                "stream": True,
+                "options": {
+                    "num_ctx": 8192,
+                    "num_predict": 2048,
+                },
+            },
+            timeout=300,
+            stream=True,
+        )
+        response.raise_for_status()
+    except requests.RequestException:
+        return ""  # model not available, skip escalation
+
+    chunks: list[str] = []
+    if show_stream:
+        print(DIM, end="", flush=True)
+    for line in response.iter_lines():
+        if not line:
+            continue
+        payload = json.loads(line)
+        token = payload.get("message", {}).get("content", "")
+        if token:
+            chunks.append(token)
+            if show_stream:
+                print(token, end="", flush=True)
+        if payload.get("done", False):
+            break
+    if show_stream:
+        print(RESET)
+
+    result = "".join(chunks).strip()
+
+    # Inject into conversation history so the local model knows what deepseek said
+    if result:
+        conversation_history.append({
+            "role": "assistant",
+            "content": f"[Local escalation ({model}) responded]: {result}"
+        })
+        if len(conversation_history) > 20:
+            conversation_history[:] = conversation_history[-20:]
+
+    return result
+
+
 _anthropic_client: Anthropic | None = None
 
 
@@ -210,7 +291,7 @@ def _get_anthropic_client() -> Anthropic:
 
 def call_anthropic(prompt: str, model: str | None = None) -> str:
     if not model:
-        model = get_env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        model = "claude-haiku-4-5"
     client = _get_anthropic_client()
 
     result = client.messages.create(
@@ -229,7 +310,7 @@ def call_anthropic(prompt: str, model: str | None = None) -> str:
 def call_anthropic_stream(prompt: str, model: str | None = None) -> str:
     """Stream an Anthropic response, printing tokens as they arrive in green."""
     if not model:
-        model = get_env("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+        model = "claude-haiku-4-5"
     client = _get_anthropic_client()
 
     collected: list[str] = []
@@ -246,10 +327,57 @@ def call_anthropic_stream(prompt: str, model: str | None = None) -> str:
     return "".join(collected).strip()
 
 
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    global _openai_client
+    if _openai_client is None:
+        api_key = get_env("OPENAI_API_KEY", required=True)
+        _openai_client = OpenAI(api_key=api_key)
+    return _openai_client
+
+
+def call_openai_stream(prompt: str, model: str | None = None) -> str:
+    """Stream an OpenAI response, printing tokens as they arrive in blue."""
+    if not model:
+        model = "gpt-5-mini"
+    client = _get_openai_client()
+
+    collected: list[str] = []
+    print(BLUE, end="", flush=True)
+    stream = client.chat.completions.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{"role": "user", "content": prompt}],
+        stream=True,
+    )
+    for chunk in stream:
+        delta = chunk.choices[0].delta if chunk.choices else None
+        if delta and delta.content:
+            print(delta.content, end="", flush=True)
+            collected.append(delta.content)
+    print(RESET)
+    return "".join(collected).strip()
+
+
 MODEL_MAP = {
     "HAIKU": "claude-haiku-4-5",
     "SONNET": "claude-sonnet-4-6",
     "OPUS": "claude-opus-4-6",
+    "GPT_MINI": "gpt-5-mini",
+    "GPT": "gpt-5.2",
+    "GPT_PRO": "gpt-5.2-pro",
+}
+
+# Which provider handles each model
+MODEL_PROVIDER = {
+    "HAIKU": "anthropic",
+    "SONNET": "anthropic",
+    "OPUS": "anthropic",
+    "GPT_MINI": "openai",
+    "GPT": "openai",
+    "GPT_PRO": "openai",
 }
 
 VALID_NEXT_STEPS = {"RESPOND_LOCALLY", "SEND_TO_REMOTE", "ASK_USER"}
@@ -313,6 +441,9 @@ COST_INFO = {
     "HAIKU": "cheap",
     "SONNET": "moderate",
     "OPUS": "expensive",
+    "GPT_MINI": "cheap",
+    "GPT": "moderate",
+    "GPT_PRO": "very expensive",
 }
 
 
@@ -488,10 +619,71 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
             print(f"\n{RED}[SAFETY] Sensitive data detected — sanitized prompt being sent.{RESET}")
 
         model_choice = parsed.get("MODEL", "HAIKU").upper().strip()
+
+        # --- Hard guardrail: OPUS and GPT_PRO require explicit user request + passphrase ---
+        if model_choice in ("OPUS", "GPT_PRO"):
+            provider_label = "Anthropic" if model_choice == "OPUS" else "OpenAI"
+            downgrade = "SONNET" if model_choice == "OPUS" else "GPT"
+            # Did the user actually ask for this model?
+            user_requested_expensive = (
+                (model_choice == "OPUS" and "use opus" in user_input.lower())
+                or (model_choice == "GPT_PRO" and "use gpt pro" in user_input.lower())
+            )
+            if user_requested_expensive:
+                # User asked for it — confirm with passphrase
+                print(f"\n{RED}⚠  {model_choice} is the most expensive {provider_label} model.{RESET}")
+                print(f"{YELLOW}Type the phrase exactly: {BOLD}Money grows on trees.{RESET}")
+                passphrase = input(f"   > ").strip()
+                if passphrase != "Money grows on trees.":
+                    print(f"{DIM}[Wrong phrase — downgrading to {downgrade}]{RESET}")
+                    model_choice = downgrade
+            else:
+                # Local model picked it on its own — auto-downgrade, no prompt
+                print(f"\n{YELLOW}[GUARDRAIL] Local model picked {model_choice} without user request — downgrading to {downgrade}{RESET}")
+                model_choice = downgrade
+
         model_id = MODEL_MAP.get(model_choice, MODEL_MAP["HAIKU"])
         remote_prompt = parsed["OUTPUT"]
         context_summary = parsed.get("CONTEXT_SUMMARY", "")
         cost = COST_INFO.get(model_choice, "unknown cost")
+
+        # --- Local escalation: try a bigger local model before going remote ---
+        escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
+        if escalation_model and not force_remote:
+            print(f"\n{CYAN}🧠 Try {escalation_model} locally before phoning a friend?{RESET}")
+            escalate_local = input(f"   {BOLD}[y]{RESET} Run locally / {BOLD}[n]{RESET} Skip to remote > ").strip().lower()
+            if escalate_local not in ("y", "yes"):
+                print(f"{DIM}[Skipping local escalation]{RESET}")
+            else:
+                print(f"\n{CYAN}--- Local escalation ({escalation_model}) ---{RESET}")
+                # Build the same context-rich prompt we'd send to the remote model
+                digest = build_conversation_digest()
+                escalation_prompt_parts: list[str] = []
+                if digest:
+                    escalation_prompt_parts.append(digest)
+                escalation_prompt_parts.append(
+                    f"The user asked: \"{user_input}\"\n\n"
+                    f"Answer this question directly and thoroughly. "
+                    f"If you truly cannot answer (e.g. it requires real-time data "
+                    f"you don't have), say exactly: \"I cannot answer this.\""
+                )
+                escalation_prompt = "\n\n".join(escalation_prompt_parts)
+
+                escalation_response = call_ollama_direct(
+                    escalation_prompt, model=escalation_model, show_stream=True
+                )
+
+                # If deepseek gave a real answer (not a punt), use it and skip remote
+                punt_phrases = ["i cannot answer", "i don't have", "i'm not able to",
+                                "i don't know", "beyond my knowledge", "no information",
+                                "i'm unable to", "i cannot provide"]
+                if escalation_response and not any(
+                    phrase in escalation_response.lower() for phrase in punt_phrases
+                ):
+                    print(f"\n{BOLD}{escalation_response}{RESET}")
+                    return
+                else:
+                    print(f"{DIM}[Escalation model punted — proceeding to remote]{RESET}")
 
         # --- Phone a Friend confirmation gate ---
         if not force_remote:
@@ -548,11 +740,15 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
         parts.append(remote_prompt)
         full_remote_prompt = "\n\n".join(parts)
 
-        print(f"\n{MAGENTA}--- Remote model ({model_choice}) ---{RESET}")
+        provider = MODEL_PROVIDER.get(model_choice, "anthropic")
+        print(f"\n{MAGENTA}--- Remote model ({model_choice} via {provider}) ---{RESET}")
         print(f"{DIM}[Sending {len(full_remote_prompt)} chars to {model_id}]{RESET}")
         print(f"{DIM}[PROMPT]: {remote_prompt}{RESET}")
         print()
-        remote_response = call_anthropic_stream(full_remote_prompt, model=model_id)
+        if provider == "openai":
+            remote_response = call_openai_stream(full_remote_prompt, model=model_id)
+        else:
+            remote_response = call_anthropic_stream(full_remote_prompt, model=model_id)
 
         # Auto-escalate: if Haiku says it doesn't know, retry with Sonnet
         dont_know_phrases = [
@@ -570,12 +766,24 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
             "i don't have",
         ]
         normalized_response = remote_response.lower().replace("\u2019", "'").replace("\u2018", "'")
-        if model_choice == "HAIKU" and any(phrase in normalized_response for phrase in dont_know_phrases):
-            escalate = input(f"\n{YELLOW}Haiku couldn't answer. Escalate to SONNET (moderate cost)? [y/n] > {RESET}").strip().lower()
+        is_cheap_model = model_choice in ("HAIKU", "GPT_MINI")
+        if is_cheap_model and any(phrase in normalized_response for phrase in dont_know_phrases):
+            # Escalate within the same provider
+            if provider == "openai":
+                upgrade_model = "GPT"
+                upgrade_id = MODEL_MAP["GPT"]
+                upgrade_cost = COST_INFO["GPT"]
+            else:
+                upgrade_model = "SONNET"
+                upgrade_id = MODEL_MAP["SONNET"]
+                upgrade_cost = COST_INFO["SONNET"]
+            escalate = input(f"\n{YELLOW}{model_choice} couldn't answer. Escalate to {upgrade_model} ({upgrade_cost} cost)? [y/n] > {RESET}").strip().lower()
             if escalate in ("y", "yes"):
-                sonnet_id = MODEL_MAP["SONNET"]
-                print(f"\n{MAGENTA}--- Escalating to SONNET ({sonnet_id}) ---{RESET}")
-                remote_response = call_anthropic_stream(full_remote_prompt, model=sonnet_id)
+                print(f"\n{MAGENTA}--- Escalating to {upgrade_model} ({upgrade_id}) ---{RESET}")
+                if provider == "openai":
+                    remote_response = call_openai_stream(full_remote_prompt, model=upgrade_id)
+                else:
+                    remote_response = call_anthropic_stream(full_remote_prompt, model=upgrade_id)
             else:
                 print(f"{DIM}[Keeping Haiku response]{RESET}")
 
@@ -593,7 +801,7 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
 
 
 def main() -> None:
-    print(f"{BOLD}{CYAN}Relay v2: Local (Ollama) → Remote (Claude){RESET}")
+    print(f"{BOLD}{CYAN}Relay v2: Local (Ollama) → Remote (Claude / GPT){RESET}")
     print(f"{DIM}Commands: 'exit' to quit, 'clear' to reset conversation{RESET}")
     print(f"{DIM}Say 'phone a friend' or '!remote' to force a remote call{RESET}\n")
 
