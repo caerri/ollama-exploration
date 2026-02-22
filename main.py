@@ -607,11 +607,15 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
             retry_raw = call_ollama(retry_prompt)
             retry_parsed = parse_local_response(retry_raw)
             output = retry_parsed["OUTPUT"]
-        print(f"\n{BOLD}{output}{RESET}")
+        local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+        print(f"\n{DIM}[{local_model}  •  !llama !deepseek !remote]{RESET}")
+        print(f"{BOLD}{output}{RESET}")
         return
 
     if next_step == "ASK_USER":
-        print(f"\n{YELLOW}{parsed['OUTPUT']}{RESET}")
+        local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+        print(f"\n{DIM}[{local_model}  •  !llama !deepseek !remote]{RESET}")
+        print(f"{YELLOW}{parsed['OUTPUT']}{RESET}")
         return
 
     if next_step == "SEND_TO_REMOTE":
@@ -680,7 +684,8 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
                 if escalation_response and not any(
                     phrase in escalation_response.lower() for phrase in punt_phrases
                 ):
-                    print(f"\n{BOLD}{escalation_response}{RESET}")
+                    print(f"\n{DIM}[{escalation_model}  •  !llama !deepseek !remote]{RESET}")
+                    print(f"{BOLD}{escalation_response}{RESET}")
                     return
                 else:
                     print(f"{DIM}[Escalation model punted — proceeding to remote]{RESET}")
@@ -702,7 +707,9 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
                 retry_raw = call_ollama(local_retry_prompt, show_stream=True)
                 try:
                     retry_parsed = parse_local_response(retry_raw)
-                    print(f"\n{BOLD}{retry_parsed['OUTPUT']}{RESET}")
+                    local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+                    print(f"\n{DIM}[{local_model}  •  !llama !deepseek !remote]{RESET}")
+                    print(f"{BOLD}{retry_parsed['OUTPUT']}{RESET}")
                 except (ValueError, json.JSONDecodeError):
                     print(f"\n{YELLOW}[NOTE] Couldn't parse retry — here's the raw response{RESET}")
                     print(retry_raw)
@@ -801,9 +808,11 @@ def relay_once(user_input: str, force_remote: bool = False) -> None:
 
 
 def main() -> None:
+    local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+    escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
     print(f"{BOLD}{CYAN}Relay v2: Local (Ollama) → Remote (Claude / GPT){RESET}")
-    print(f"{DIM}Commands: 'exit' to quit, 'clear' to reset conversation{RESET}")
-    print(f"{DIM}Say 'phone a friend' or '!remote' to force a remote call{RESET}\n")
+    print(f"{DIM}Shortcuts:  !llama = {local_model}  |  !deepseek = {escalation_model or 'not configured'}  |  !remote / phone a friend = API{RESET}")
+    print(f"{DIM}Commands:   exit, clear{RESET}\n")
 
     while True:
         # Flush any leftover bytes in stdin (e.g. from a multi-line paste)
@@ -821,18 +830,71 @@ def main() -> None:
             print(f"{CYAN}[Conversation cleared]{RESET}")
             continue
 
-        # Detect explicit remote triggers
+        # Detect explicit model triggers
         force_remote = False
+        force_deepseek = False
+        force_llama = False
         lower_input = user_input.lower()
-        for trigger in ["phone a friend", "!remote"]:
-            if trigger in lower_input:
-                force_remote = True
-                # Strip the trigger phrase so the local model gets a clean question
-                user_input = user_input[:lower_input.index(trigger)] + user_input[lower_input.index(trigger) + len(trigger):]
-                user_input = user_input.strip()
-                if not user_input:
-                    user_input = "The user wants to phone a friend but didn't specify a question. Ask them what they'd like to send to the remote model."
-                break
+
+        # !deepseek — skip llama, go straight to deepseek
+        if "!deepseek" in lower_input:
+            force_deepseek = True
+            user_input = user_input[:lower_input.index("!deepseek")] + user_input[lower_input.index("!deepseek") + len("!deepseek"):]
+            user_input = user_input.strip()
+            if not user_input:
+                user_input = "Say hello and ask what the user would like to discuss."
+
+        # !llama — force local model (no escalation, no remote)
+        elif "!llama" in lower_input:
+            force_llama = True
+            user_input = user_input[:lower_input.index("!llama")] + user_input[lower_input.index("!llama") + len("!llama"):]
+            user_input = user_input.strip()
+            if not user_input:
+                user_input = "Say hello and ask what the user would like to discuss."
+
+        else:
+            for trigger in ["phone a friend", "!remote"]:
+                if trigger in lower_input:
+                    force_remote = True
+                    user_input = user_input[:lower_input.index(trigger)] + user_input[lower_input.index(trigger) + len(trigger):]
+                    user_input = user_input.strip()
+                    if not user_input:
+                        user_input = "The user wants to phone a friend but didn't specify a question. Ask them what they'd like to send to the remote model."
+                    break
+
+        # !deepseek — send directly to escalation model, skip everything else
+        if force_deepseek:
+            escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
+            if not escalation_model:
+                print(f"{YELLOW}No escalation model configured (OLLAMA_ESCALATION_MODEL is empty){RESET}")
+            else:
+                digest = build_conversation_digest()
+                parts: list[str] = []
+                if digest:
+                    parts.append(digest)
+                parts.append(user_input)
+                full_prompt = "\n\n".join(parts)
+                print(f"\n{CYAN}--- {escalation_model} ---{RESET}")
+                response = call_ollama_direct(full_prompt, model=escalation_model, show_stream=True)
+                if response:
+                    print(f"\n{DIM}[{escalation_model}  •  !llama !deepseek !remote]{RESET}")
+                    print(f"{BOLD}{response}{RESET}")
+                else:
+                    print(f"{YELLOW}[No response from {escalation_model}]{RESET}")
+            continue
+
+        # !llama — send directly to local model, force RESPOND_LOCALLY
+        if force_llama:
+            try:
+                print(f"\n{CYAN}--- Local model ---{RESET}")
+                local_raw = call_ollama(user_input, show_stream=True)
+                parsed = parse_local_response(local_raw)
+                local_model_name = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+                print(f"\n{DIM}[{local_model_name}  •  !llama !deepseek !remote]{RESET}")
+                print(f"{BOLD}{parsed['OUTPUT']}{RESET}")
+            except (ValueError, json.JSONDecodeError):
+                print(f"{YELLOW}[Couldn't parse response]{RESET}")
+            continue
 
         try:
             relay_once(user_input, force_remote=force_remote)
