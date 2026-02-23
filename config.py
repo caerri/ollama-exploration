@@ -49,6 +49,28 @@ CALENDAR_KEYWORDS = [
     "today's schedule", "tomorrow's schedule",
 ]
 
+# Obsidian journal settings
+OBSIDIAN_VAULT_PATH = get_env("OBSIDIAN_VAULT_PATH", "~/Documents/vault-zero")
+JOURNAL_LOOKBACK_DAYS = 7
+
+# Keywords that trigger journal context injection
+JOURNAL_KEYWORDS = [
+    "journal", "diary", "daily note", "daily notes",
+    "how am i doing", "how's my week", "how is my week",
+    "how was my week", "how's my day", "how was my day",
+    "what did i do", "what have i done", "what have i been doing",
+    "what did i work on", "what have i worked on",
+    "my progress", "my mood", "my energy",
+    "what got done", "what didn't get done",
+    "my habits", "my routine",
+    "my blockers", "what's blocking",
+    "review my week", "weekly review", "week review",
+    "how's it going", "how am i",
+    "workload", "overwhelmed", "burned out", "burnout",
+    "time management", "productivity",
+    "should i take", "can i handle", "am i overloaded",
+]
+
 
 _LOCAL_MODEL = get_env("OLLAMA_MODEL", "gemma2:9b")
 
@@ -111,6 +133,21 @@ Claude — code, analysis, technical:
 GPT — creative, brainstorming:
   GPT_MINI (cheap) — default. GPT (moderate) — stronger. GPT_PRO — NEVER unless user says "use gpt pro".
 Code → HAIKU/SONNET. Creative → GPT_MINI/GPT. Unsure → HAIKU. Set model to NONE when local.
+
+PERSONAL CONTEXT:
+When the user's message includes a "--- Your Calendar ---" or "--- Your Journal ---" block,
+that's real data from their actual life. Use it.
+- Calendar: their real upcoming schedule (events, times, free slots).
+- Journal: daily notes with mood (1-5), energy (1-5), sleep hours, planned tasks,
+  what actually happened, wins, blockers.
+- Cross-reference these: if they have a packed schedule but logged low energy, suggest
+  rescheduling or rest. If planned tasks aren't getting done, acknowledge it without
+  guilt-tripping — help them reprioritize.
+- Track patterns: "you've logged low energy 3 of the last 5 days" or "you haven't
+  exercised since Tuesday" — but only when relevant to what the user asked.
+- [x] = done, [ ] = not done. Compare Plan vs What Happened to assess completion rate.
+- Never fabricate journal data. If a day says "(no entry)" that means they didn't write one.
+- Be practical: suggest concrete schedule changes, not vague advice like "take care of yourself."
 
 RESPONSE QUALITY:
 - Thorough answers. Match length to complexity. Use \\n\\n for paragraph breaks.

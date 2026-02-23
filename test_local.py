@@ -9,16 +9,21 @@ Tests cover:
   6. Config sanity — MODEL_MAP, MODEL_SHORTCUTS, COST_INFO, calendar keywords
   7. Calendar keyword detection — matching logic used by main.py
   8. Natural conversation flow — multi-turn scenarios that broke in real usage
+  9. Journal keyword detection — matching logic for Obsidian journal injection
+ 10. Journal template parsing — YAML frontmatter + markdown section extraction
 """
 
 from __future__ import annotations
 
 import json
+import tempfile
+from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 from config import (
     MODEL_MAP, MODEL_PROVIDER, MODEL_SHORTCUTS, COST_INFO,
     VALID_NEXT_STEPS, MAX_HISTORY, CALENDAR_KEYWORDS, CALENDAR_LOOKAHEAD_DAYS,
+    JOURNAL_KEYWORDS, JOURNAL_LOOKBACK_DAYS,
     BOLD, RESET, DIM, CYAN, GREEN, YELLOW, RED,
 )
 from conversation import (
@@ -27,6 +32,7 @@ from conversation import (
     parse_local_response,
 )
 from clients import get_ollama_models
+from obsidian_client import _parse_daily_note, _format_entry, get_journal_context
 
 
 # ======================================================================
@@ -1076,12 +1082,312 @@ def test_natural_conversation_flow():
 
 
 # ======================================================================
+# 9. Journal keyword detection
+# ======================================================================
+
+def test_journal_keywords():
+    _section("9. Journal Keyword Detection")
+    passed = 0
+    failed = 0
+
+    # --- 9a. JOURNAL_LOOKBACK_DAYS is reasonable ---
+    try:
+        assert 1 <= JOURNAL_LOOKBACK_DAYS <= 30, f"got {JOURNAL_LOOKBACK_DAYS}"
+        _pass(f"JOURNAL_LOOKBACK_DAYS={JOURNAL_LOOKBACK_DAYS} is reasonable"); passed += 1
+    except Exception as e:
+        _fail("JOURNAL_LOOKBACK_DAYS is reasonable", str(e)); failed += 1
+
+    # --- 9b. JOURNAL_KEYWORDS is non-empty ---
+    try:
+        assert len(JOURNAL_KEYWORDS) > 0
+        _pass(f"JOURNAL_KEYWORDS has {len(JOURNAL_KEYWORDS)} entries"); passed += 1
+    except Exception as e:
+        _fail("JOURNAL_KEYWORDS is non-empty", str(e)); failed += 1
+
+    # --- 9c. Expected phrases trigger matches ---
+    should_match = [
+        "how am i doing this week",
+        "how's my week been",
+        "what did i work on yesterday",
+        "review my progress",
+        "i'm feeling overwhelmed today",
+        "what got done this week",
+        "my energy is super low",
+        "how am i handling my workload",
+        "i feel burned out",
+        "let's look at my journal",
+    ]
+    for phrase in should_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in JOURNAL_KEYWORDS)
+            assert matched, f"'{phrase}' should match but didn't"
+            _pass(f"Matches: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"Matches: '{phrase}'", str(e)); failed += 1
+
+    # --- 9d. Non-journal phrases do NOT trigger ---
+    should_not_match = [
+        "hey what's up",
+        "write me a python script",
+        "who is the president",
+        "explain quantum computing",
+        "what's 2 + 2",
+    ]
+    for phrase in should_not_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in JOURNAL_KEYWORDS)
+            assert not matched, f"'{phrase}' should NOT match but did"
+            _pass(f"No match: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"No match: '{phrase}'", str(e)); failed += 1
+
+    # --- 9e. All keywords are lowercase ---
+    try:
+        for kw in JOURNAL_KEYWORDS:
+            assert kw == kw.lower(), f"keyword '{kw}' is not lowercase"
+        _pass("All journal keywords are lowercase"); passed += 1
+    except Exception as e:
+        _fail("All journal keywords are lowercase", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} journal_keywords sub-tests failed"
+
+
+# ======================================================================
+# 10. Journal template parsing
+# ======================================================================
+
+def test_journal_parsing():
+    _section("10. Journal Template Parsing")
+    passed = 0
+    failed = 0
+
+    # --- 10a. Valid daily note with all fields parses correctly ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-22.md"
+        note.write_text(
+            "---\n"
+            "date: \"2026-02-22\"\n"
+            "day: \"Saturday\"\n"
+            "mood: 4\n"
+            "energy: 3\n"
+            "sleep_hours: 7\n"
+            "tags: [school, coding]\n"
+            "---\n\n"
+            "## Plan\n"
+            "- [x] finish relay code\n"
+            "- [ ] study linear algebra\n"
+            "- [ ] gym\n\n"
+            "## What Happened\n"
+            "Mostly coding today. Got the journal integration working.\n\n"
+            "## Wins\n"
+            "Journal integration shipped!\n\n"
+            "## Blockers\n"
+            "Didn't start studying yet.\n\n"
+            "## Notes\n"
+            "Need to plan study time for midterm.\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            assert parsed is not None
+            assert parsed["frontmatter"]["mood"] == 4
+            assert parsed["frontmatter"]["energy"] == 3
+            assert parsed["frontmatter"]["sleep_hours"] == 7
+            assert "school" in parsed["frontmatter"]["tags"]
+            assert "Plan" in parsed["sections"]
+            assert "[x] finish relay code" in parsed["sections"]["Plan"]
+            assert "What Happened" in parsed["sections"]
+            assert "Wins" in parsed["sections"]
+            assert "Blockers" in parsed["sections"]
+            assert "Notes" in parsed["sections"]
+            assert parsed["date"] == "2026-02-22"
+            _pass("10a. Valid note with all fields parses correctly"); passed += 1
+        except Exception as e:
+            _fail("10a. Valid note parses correctly", str(e)); failed += 1
+
+    # --- 10b. Frontmatter with missing fields handled gracefully ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-21.md"
+        note.write_text(
+            "---\n"
+            "date: \"2026-02-21\"\n"
+            "mood:\n"
+            "energy:\n"
+            "---\n\n"
+            "## What Happened\n"
+            "Quick note — not much today.\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            assert parsed is not None
+            assert parsed["frontmatter"].get("mood") is None
+            assert "What Happened" in parsed["sections"]
+            _pass("10b. Missing frontmatter fields handled gracefully"); passed += 1
+        except Exception as e:
+            _fail("10b. Missing frontmatter fields", str(e)); failed += 1
+
+    # --- 10c. Empty sections are omitted from formatted output ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-20.md"
+        note.write_text(
+            "---\n"
+            "date: \"2026-02-20\"\n"
+            "mood: 3\n"
+            "energy: 2\n"
+            "sleep_hours: 5.5\n"
+            "---\n\n"
+            "## Plan\n\n"
+            "## What Happened\n"
+            "Just a rough day.\n\n"
+            "## Wins\n\n"
+            "## Blockers\n\n"
+            "## Notes\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            assert "Plan" not in parsed["sections"], "empty Plan should be omitted"
+            assert "Wins" not in parsed["sections"], "empty Wins should be omitted"
+            assert "Blockers" not in parsed["sections"], "empty Blockers should be omitted"
+            assert "Notes" not in parsed["sections"], "empty Notes should be omitted"
+            assert "What Happened" in parsed["sections"]
+            _pass("10c. Empty sections omitted from parsed output"); passed += 1
+        except Exception as e:
+            _fail("10c. Empty sections omitted", str(e)); failed += 1
+
+    # --- 10d. Checkbox state preserved in Plan section ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-19.md"
+        note.write_text(
+            "---\ndate: \"2026-02-19\"\nmood: 4\n---\n\n"
+            "## Plan\n"
+            "- [x] study math\n"
+            "- [ ] go to gym\n"
+            "- [x] finish code\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            formatted = _format_entry(parsed)
+            assert "[x] study math" in formatted
+            assert "[ ] go to gym" in formatted
+            assert "[x] finish code" in formatted
+            _pass("10d. Checkbox state preserved in formatted Plan"); passed += 1
+        except Exception as e:
+            _fail("10d. Checkbox state preserved", str(e)); failed += 1
+
+    # --- 10e. Very long section content is truncated ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-18.md"
+        long_text = "This is a very long journal entry. " * 20  # ~700 chars
+        note.write_text(
+            "---\ndate: \"2026-02-18\"\nmood: 3\n---\n\n"
+            f"## What Happened\n{long_text}\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            formatted = _format_entry(parsed)
+            # The formatted "Happened:" line should be truncated
+            for line in formatted.split("\n"):
+                if "Happened:" in line:
+                    assert len(line) < 200, f"line too long: {len(line)} chars"
+                    assert line.rstrip().endswith("...")
+                    break
+            _pass("10e. Long section content truncated with ..."); passed += 1
+        except Exception as e:
+            _fail("10e. Long section truncated", str(e)); failed += 1
+
+    # --- 10f. File with no frontmatter still returns body ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-17.md"
+        note.write_text(
+            "## What Happened\n"
+            "Just a plain note without frontmatter.\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            assert parsed is not None
+            assert parsed["frontmatter"] == {}
+            assert "What Happened" in parsed["sections"]
+            _pass("10f. No frontmatter — body still parsed"); passed += 1
+        except Exception as e:
+            _fail("10f. No frontmatter handling", str(e)); failed += 1
+
+    # --- 10g. File with malformed YAML frontmatter doesn't crash ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-16.md"
+        note.write_text(
+            "---\n"
+            "mood: [broken: yaml: here\n"
+            "---\n\n"
+            "## What Happened\n"
+            "Note with bad YAML.\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            assert parsed is not None
+            assert "What Happened" in parsed["sections"]
+            _pass("10g. Malformed YAML doesn't crash"); passed += 1
+        except Exception as e:
+            _fail("10g. Malformed YAML handling", str(e)); failed += 1
+
+    # --- 10h. get_journal_context returns "" for nonexistent vault ---
+    try:
+        result = get_journal_context(vault_path="/nonexistent/vault/path/xyz")
+        assert result == "", f"expected empty string, got: {result!r}"
+        _pass("10h. Nonexistent vault → empty string"); passed += 1
+    except Exception as e:
+        _fail("10h. Nonexistent vault", str(e)); failed += 1
+
+    # --- 10i. get_journal_context returns wrapper for empty Journal dir ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        journal_dir = Path(tmpdir) / "Journal" / "Daily"
+        journal_dir.mkdir(parents=True)
+        try:
+            result = get_journal_context(days=3, vault_path=tmpdir)
+            assert "--- Your Journal" in result
+            assert "No journal entries" in result or "(no entry)" in result
+            assert "--- End Journal ---" in result
+            _pass("10i. Empty Journal dir → proper wrapper"); passed += 1
+        except Exception as e:
+            _fail("10i. Empty Journal dir", str(e)); failed += 1
+
+    # --- 10j. Context format matches expected structure ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        journal_dir = Path(tmpdir) / "Journal" / "Daily"
+        journal_dir.mkdir(parents=True)
+        from datetime import datetime
+        today = datetime.now().strftime("%Y-%m-%d")
+        (journal_dir / f"{today}.md").write_text(
+            "---\ndate: \"" + today + "\"\nmood: 4\nenergy: 3\nsleep_hours: 7\n---\n\n"
+            "## Plan\n- [x] test things\n\n"
+            "## What Happened\nTesting the journal integration.\n"
+        )
+        try:
+            # Clear cache to force re-read
+            import obsidian_client
+            obsidian_client._cache = (0.0, "")
+
+            result = get_journal_context(days=3, vault_path=tmpdir)
+            assert result.startswith("--- Your Journal")
+            assert result.endswith("--- End Journal ---")
+            assert "mood:4" in result
+            assert "energy:3" in result
+            assert "sleep:7h" in result
+            assert "[x] test things" in result
+            _pass("10j. Context format matches expected structure"); passed += 1
+        except Exception as e:
+            _fail("10j. Context format structure", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} journal_parsing sub-tests failed"
+
+
+# ======================================================================
 # Main (standalone runner — also works with pytest)
 # ======================================================================
 
 def main():
     print(f"{BOLD}{CYAN}Local Test Suite — No API Calls{RESET}")
-    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, and calendar{RESET}")
+    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, calendar, and journal{RESET}")
 
     total_passed = 0
     total_failed = 0
@@ -1095,6 +1401,8 @@ def main():
         test_config_sanity,
         test_calendar_keywords,
         test_natural_conversation_flow,
+        test_journal_keywords,
+        test_journal_parsing,
     ]:
         try:
             test_fn()
