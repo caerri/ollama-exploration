@@ -2,11 +2,13 @@
 
 Tests cover:
   1. parse_local_response() — JSON parsing, fallback regex, key normalization, validation
-  2. build_conversation_digest() — plain-text digest for escalation models
-  3. build_remote_messages() — message building, JSON stripping, routing word detection
-  4. Conversation history management — add_message, clear_history, trimming
+  2. Conversation history management — add_message, clear_history, trimming
+  3. build_conversation_digest() — plain-text digest for escalation models
+  4. build_remote_messages() — message building, JSON stripping, routing word detection
   5. get_ollama_models() — shortcut generation from Ollama API response
-  6. Config sanity — MODEL_MAP, MODEL_SHORTCUTS, COST_INFO consistency
+  6. Config sanity — MODEL_MAP, MODEL_SHORTCUTS, COST_INFO, calendar keywords
+  7. Calendar keyword detection — matching logic used by main.py
+  8. Natural conversation flow — multi-turn scenarios that broke in real usage
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from unittest.mock import patch, MagicMock
 
 from config import (
     MODEL_MAP, MODEL_PROVIDER, MODEL_SHORTCUTS, COST_INFO,
-    VALID_NEXT_STEPS, MAX_HISTORY,
+    VALID_NEXT_STEPS, MAX_HISTORY, CALENDAR_KEYWORDS, CALENDAR_LOOKAHEAD_DAYS,
     BOLD, RESET, DIM, CYAN, GREEN, YELLOW, RED,
 )
 from conversation import (
@@ -177,7 +179,7 @@ def test_parse_local_response():
     except Exception as e:
         _fail("Whitespace around values is stripped", str(e)); failed += 1
 
-    return passed, failed
+    assert failed == 0, f"{failed} parse_local_response sub-tests failed"
 
 
 # ======================================================================
@@ -233,7 +235,7 @@ def test_conversation_history():
         _fail("History is shared across imports", str(e)); failed += 1
 
     _reset()
-    return passed, failed
+    assert failed == 0, f"{failed} conversation_history sub-tests failed"
 
 
 # ======================================================================
@@ -348,7 +350,7 @@ def test_build_conversation_digest():
         _fail("Local escalation responses included", str(e)); failed += 1
 
     _reset()
-    return passed, failed
+    assert failed == 0, f"{failed} build_conversation_digest sub-tests failed"
 
 
 # ======================================================================
@@ -512,7 +514,7 @@ def test_build_remote_messages():
         _fail("Consecutive same-role messages collapsed", str(e)); failed += 1
 
     _reset()
-    return passed, failed
+    assert failed == 0, f"{failed} build_remote_messages sub-tests failed"
 
 
 # ======================================================================
@@ -628,7 +630,7 @@ def test_get_ollama_models():
         except Exception as e:
             _fail("Ollama offline → empty dict", str(e)); failed += 1
 
-    return passed, failed
+    assert failed == 0, f"{failed} get_ollama_models sub-tests failed"
 
 
 # ======================================================================
@@ -688,16 +690,398 @@ def test_config_sanity():
     except Exception as e:
         _fail(f"MAX_HISTORY={MAX_HISTORY} is reasonable", str(e)); failed += 1
 
-    return passed, failed
+    assert failed == 0, f"{failed} config_sanity sub-tests failed"
 
 
 # ======================================================================
-# Main
+# 7. Calendar keyword detection
+# ======================================================================
+
+def test_calendar_keywords():
+    _section("7. Calendar Keyword Detection")
+    passed = 0
+    failed = 0
+
+    # --- 7a. CALENDAR_LOOKAHEAD_DAYS is reasonable ---
+    try:
+        assert 1 <= CALENDAR_LOOKAHEAD_DAYS <= 30, f"got {CALENDAR_LOOKAHEAD_DAYS}"
+        _pass(f"CALENDAR_LOOKAHEAD_DAYS={CALENDAR_LOOKAHEAD_DAYS} is reasonable"); passed += 1
+    except Exception as e:
+        _fail("CALENDAR_LOOKAHEAD_DAYS is reasonable", str(e)); failed += 1
+
+    # --- 7b. CALENDAR_KEYWORDS is non-empty ---
+    try:
+        assert len(CALENDAR_KEYWORDS) > 0
+        _pass(f"CALENDAR_KEYWORDS has {len(CALENDAR_KEYWORDS)} entries"); passed += 1
+    except Exception as e:
+        _fail("CALENDAR_KEYWORDS is non-empty", str(e)); failed += 1
+
+    # --- 7c. Expected keywords trigger matches ---
+    should_match = [
+        "what's on my calendar today",
+        "am i free thursday",
+        "do i have any meetings tomorrow",
+        "what's my schedule this week",
+        "is there an appointment on friday",
+        "what do i have going on",
+        "evaluate my week",
+        "am i busy tomorrow",
+    ]
+    for phrase in should_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in CALENDAR_KEYWORDS)
+            assert matched, f"'{phrase}' should match but didn't"
+            _pass(f"Matches: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"Matches: '{phrase}'", str(e)); failed += 1
+
+    # --- 7d. Non-calendar phrases do NOT trigger ---
+    should_not_match = [
+        "hey what's up",
+        "write me a python script",
+        "who is the president",
+        "tell me about quantum computing",
+        "how do gallstones form",
+    ]
+    for phrase in should_not_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in CALENDAR_KEYWORDS)
+            assert not matched, f"'{phrase}' should NOT match but did"
+            _pass(f"No match: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"No match: '{phrase}'", str(e)); failed += 1
+
+    # --- 7e. All keywords are lowercase ---
+    try:
+        for kw in CALENDAR_KEYWORDS:
+            assert kw == kw.lower(), f"keyword '{kw}' is not lowercase"
+        _pass("All keywords are lowercase"); passed += 1
+    except Exception as e:
+        _fail("All keywords are lowercase", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} calendar_keywords sub-tests failed"
+
+
+# ======================================================================
+# 8. Natural conversation flow — simulates realistic multi-turn exchanges
+#    to verify context handling, digest building, and message construction
+#    across the same scenarios that broke in real usage.
+# ======================================================================
+
+def test_natural_conversation_flow():
+    _section("8. Natural Conversation Flow")
+    passed = 0
+    failed = 0
+
+    # ------------------------------------------------------------------
+    # 8a. GPT Pro answers, user says "i'm good" — context should carry
+    # ------------------------------------------------------------------
+    _reset()
+    # User asks about Apple Calendar + Python
+    add_message("user", "i need the mac to connect to apple calendar through python")
+    # Local model routes to remote
+    add_message("assistant", json.dumps({
+        "analysis": "User wants Python + Apple Calendar",
+        "sensitive_data": "NO",
+        "next_step": "SEND_TO_REMOTE",
+        "model": "HAIKU",
+        "output": "i need the mac to connect to apple calendar through python"
+    }))
+    # GPT Pro responds with a big answer
+    gpt_response = (
+        "You've got 3 ways to talk to Apple Calendar from Python on macOS:\n\n"
+        "1) EventKit via PyObjC — best for local Calendar app\n"
+        "2) AppleScript/JXA — clunkier but works\n"
+        "3) CalDAV — best for network API access\n\n"
+        "If you want 'connect to the Calendar app on this Mac', use EventKit.\n\n"
+        "Install: pip install pyobjc pyobjc-framework-EventKit\n"
+        "Permission: System Settings > Privacy > Calendars"
+    )
+    add_message("assistant", f"[Remote model (GPT_PRO) responded]: {gpt_response}")
+    # User says "i'm good"
+    add_message("user", "i'm good")
+
+    try:
+        # The digest should contain the GPT Pro response
+        digest = build_conversation_digest()
+        assert "EventKit" in digest, "GPT Pro's EventKit answer missing from digest"
+        assert "User: i'm good" in digest, "User's 'i'm good' missing from digest"
+        _pass("8a. GPT Pro response + 'i'm good' both in digest"); passed += 1
+    except Exception as e:
+        _fail("8a. GPT Pro response + 'i'm good' in digest", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8b. "evaluate what gpt pro said" — should see the response in history
+    # ------------------------------------------------------------------
+    add_message("user", "evaluate what gpt pro said")
+    # Simulate local model's routing JSON for this turn
+    add_message("assistant", json.dumps({
+        "analysis": "User wants evaluation of GPT Pro response",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "GPT Pro gave you three solid options for connecting to Apple Calendar. "
+                  "EventKit is the right call for local access — it reads the same database "
+                  "the Calendar app uses. The code example covers permissions and event reading."
+    }))
+    try:
+        digest = build_conversation_digest()
+        # Both the GPT Pro response and the evaluation should be present
+        assert "EventKit" in digest
+        assert "evaluate what gpt pro said" in digest
+        assert "three solid options" in digest or "right call" in digest
+        _pass("8b. Evaluation turn preserved in context"); passed += 1
+    except Exception as e:
+        _fail("8b. Evaluation turn preserved in context", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8c. Remote response flows cleanly to next remote call
+    # ------------------------------------------------------------------
+    _reset()
+    add_message("user", "what is rust?")
+    add_message("assistant", "[Remote model (HAIKU) responded]: Rust is a systems programming language focused on safety and performance.")
+    add_message("user", "how does the borrow checker work?")
+    add_message("assistant", json.dumps({
+        "analysis": "Follow up on Rust",
+        "sensitive_data": "NO",
+        "next_step": "SEND_TO_REMOTE",
+        "model": "SONNET",
+        "output": "how does the borrow checker work?"
+    }))
+    try:
+        msgs = build_remote_messages("how does the borrow checker work?")
+        # Sonnet should see the clean Haiku response (no prefix)
+        asst_msgs = [m for m in msgs if m["role"] == "assistant"]
+        assert len(asst_msgs) >= 1
+        assert "Rust is a systems programming language" in asst_msgs[0]["content"]
+        assert not asst_msgs[0]["content"].startswith("[Remote model")
+        # Final message should be the follow-up question
+        assert "borrow checker" in msgs[-1]["content"].lower()
+        _pass("8c. Remote response clean in next remote call"); passed += 1
+    except Exception as e:
+        _fail("8c. Remote response clean in next remote call", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8d. Multi-turn budget conversation — running total scenario
+    # ------------------------------------------------------------------
+    _reset()
+    add_message("user", "help me save $1780 per month")
+    add_message("assistant", json.dumps({
+        "analysis": "User wants to save money",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "Let's go through your expenses and find savings. What are your main monthly costs?"
+    }))
+    add_message("user", "$1k rent, netflix $7.99, hulu $2, car payment, insurance, food")
+    add_message("assistant", json.dumps({
+        "analysis": "User listed expenses",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "OK so rent is $1000, Netflix $7.99, Hulu $2. Let's start with the subscriptions."
+    }))
+    add_message("user", "i already cancelled netflix. keep a running total")
+    add_message("assistant", json.dumps({
+        "analysis": "User cancelled Netflix, wants running total",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "Netflix cancelled — that's $7.99/mo saved.\n\n"
+                  "Running total: $7.99 saved / $1772.01 left to go.\n\n"
+                  "Next up — Hulu at $2. Want to cut that too?"
+    }))
+    add_message("user", "yeah cut hulu too")
+    try:
+        digest = build_conversation_digest()
+        # All key context should survive in the digest
+        assert "$1780" in digest or "1780" in digest, "Original goal missing"
+        assert "netflix" in digest.lower() or "Netflix" in digest, "Netflix discussion missing"
+        assert "7.99" in digest, "Netflix amount missing"
+        assert "running total" in digest.lower() or "Running total" in digest, "Running total missing"
+        assert "hulu" in digest.lower() or "Hulu" in digest, "Hulu discussion missing"
+        _pass("8d. Multi-turn budget conversation preserved in digest"); passed += 1
+    except Exception as e:
+        _fail("8d. Multi-turn budget conversation preserved", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8e. Frustration + profanity doesn't break context
+    # ------------------------------------------------------------------
+    _reset()
+    add_message("user", "really")
+    add_message("assistant", json.dumps({
+        "analysis": "User said really — unclear intent",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "What's on your mind?"
+    }))
+    add_message("user", "i didn't say hey. i said really. are you fuckin dumb.")
+    add_message("assistant", json.dumps({
+        "analysis": "User is frustrated about misinterpretation",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "My bad — you said 'really', not 'hey'. What were you reacting to?"
+    }))
+    try:
+        digest = build_conversation_digest()
+        assert "really" in digest.lower()
+        assert "my bad" in digest.lower() or "My bad" in digest
+        # The model should NOT have said "hey" in its response
+        local_responses = [line for line in digest.split("\n") if line.startswith("Local model:")]
+        for resp in local_responses:
+            assert "Hello" not in resp, "Model hallucinated a greeting"
+            assert "How can I assist" not in resp, "Model used banned phrase"
+        _pass("8e. Frustration handled, no hallucinated greetings"); passed += 1
+    except Exception as e:
+        _fail("8e. Frustration handled correctly", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8f. Dismissive reply after remote — routing words still work
+    # ------------------------------------------------------------------
+    _reset()
+    add_message("user", "explain how transformers work in machine learning")
+    add_message("assistant", json.dumps({
+        "analysis": "Complex ML question",
+        "sensitive_data": "NO",
+        "next_step": "SEND_TO_REMOTE",
+        "model": "SONNET",
+        "output": "explain how transformers work in machine learning"
+    }))
+    try:
+        # "yup" at Phone a Friend should find the real question
+        msgs = build_remote_messages("yup")
+        last = msgs[-1]
+        assert last["role"] == "user"
+        assert "transformer" in last["content"].lower()
+        assert "yup" not in last["content"].lower()
+        _pass("8f. 'yup' routes real question, not the word 'yup'"); passed += 1
+    except Exception as e:
+        _fail("8f. 'yup' routing word detection", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8g. Long conversation doesn't lose early context within limits
+    # ------------------------------------------------------------------
+    _reset()
+    # Simulate 8 turns of conversation (16 messages = within MAX_HISTORY of 40)
+    add_message("user", "my name is Carrie and I'm trying to build a budgeting app")
+    add_message("assistant", json.dumps({
+        "analysis": "User introduction",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "Hey Carrie! A budgeting app sounds great. What tech stack are you thinking?"
+    }))
+    for i in range(6):
+        add_message("user", f"follow-up question {i} about the budgeting app")
+        add_message("assistant", json.dumps({
+            "analysis": f"follow-up {i}",
+            "sensitive_data": "NO",
+            "next_step": "RESPOND_LOCALLY",
+            "model": "NONE",
+            "output": f"Here's my answer to follow-up {i} about the budgeting app."
+        }))
+    add_message("user", "what was my name again?")
+    try:
+        digest = build_conversation_digest()
+        assert "Carrie" in digest, "User's name lost from context"
+        assert "budgeting" in digest.lower(), "Project topic lost from context"
+        _pass("8g. Early context (name, topic) survives 8-turn conversation"); passed += 1
+    except Exception as e:
+        _fail("8g. Early context survives long conversation", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8h. Calendar context mixed with regular question
+    # ------------------------------------------------------------------
+    _reset()
+    cal_block = (
+        "--- Your Calendar (next 7 days) ---\n"
+        "Today (Sat Feb 22):\n"
+        "  - 3:00 PM - 4:00 PM: Dentist appointment\n"
+        "  - 7:00 PM - 9:00 PM: Dinner with Alex\n"
+        "Mon Feb 24:\n"
+        "  - 9:00 AM - 10:00 AM: Team standup\n"
+        "--- End Calendar ---"
+    )
+    # This simulates what main.py does — prepending calendar context
+    user_msg_with_cal = f"{cal_block}\n\nam i free tomorrow"
+    add_message("user", user_msg_with_cal)
+    add_message("assistant", json.dumps({
+        "analysis": "User asks about availability with calendar context",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "Looking at your calendar, tomorrow (Sunday Feb 23) is completely clear — no events scheduled."
+    }))
+    try:
+        digest = build_conversation_digest()
+        assert "Dentist" in digest, "Calendar events missing from digest"
+        assert "free tomorrow" in digest.lower() or "am i free" in digest.lower()
+        assert "completely clear" in digest or "no events" in digest
+        _pass("8h. Calendar context + question preserved in digest"); passed += 1
+    except Exception as e:
+        _fail("8h. Calendar context in digest", str(e)); failed += 1
+
+    # ------------------------------------------------------------------
+    # 8i. Mixed local + remote turns build correct remote messages
+    # ------------------------------------------------------------------
+    _reset()
+    add_message("user", "hey what's up")
+    add_message("assistant", json.dumps({
+        "analysis": "greeting",
+        "sensitive_data": "NO",
+        "next_step": "RESPOND_LOCALLY",
+        "model": "NONE",
+        "output": "Not much! What are you working on?"
+    }))
+    add_message("user", "who won the super bowl this year")
+    add_message("assistant", json.dumps({
+        "analysis": "current events",
+        "sensitive_data": "NO",
+        "next_step": "SEND_TO_REMOTE",
+        "model": "HAIKU",
+        "output": "who won the super bowl this year"
+    }))
+    add_message("assistant", "[Remote model (HAIKU) responded]: The Kansas City Chiefs won Super Bowl LX.")
+    add_message("user", "cool. now tell me more about the game")
+    add_message("assistant", json.dumps({
+        "analysis": "follow-up on super bowl",
+        "sensitive_data": "NO",
+        "next_step": "SEND_TO_REMOTE",
+        "model": "HAIKU",
+        "output": "tell me more about the game"
+    }))
+    try:
+        msgs = build_remote_messages("cool. now tell me more about the game")
+        # Haiku should see: the greeting exchange, its own previous answer, and the follow-up
+        roles = [m["role"] for m in msgs]
+        # Must alternate
+        for i in range(len(roles) - 1):
+            assert roles[i] != roles[i+1], f"consecutive {roles[i]} at {i}"
+        # Must start with user
+        assert roles[0] == "user"
+        # Previous Haiku answer should be in there (cleaned)
+        all_content = " ".join(m["content"] for m in msgs)
+        assert "Chiefs" in all_content or "Super Bowl" in all_content, "Previous remote answer missing"
+        assert "[Remote model" not in all_content, "Remote prefix leaked through"
+        _pass("8i. Mixed local+remote turns → correct remote messages"); passed += 1
+    except Exception as e:
+        _fail("8i. Mixed local+remote turns", str(e)); failed += 1
+
+    _reset()
+    assert failed == 0, f"{failed} natural_conversation_flow sub-tests failed"
+
+
+# ======================================================================
+# Main (standalone runner — also works with pytest)
 # ======================================================================
 
 def main():
     print(f"{BOLD}{CYAN}Local Test Suite — No API Calls{RESET}")
-    print(f"{DIM}Testing parse, conversation, digest, shortcuts, and config{RESET}")
+    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, and calendar{RESET}")
 
     total_passed = 0
     total_failed = 0
@@ -709,10 +1093,14 @@ def main():
         test_build_remote_messages,
         test_get_ollama_models,
         test_config_sanity,
+        test_calendar_keywords,
+        test_natural_conversation_flow,
     ]:
-        p, f = test_fn()
-        total_passed += p
-        total_failed += f
+        try:
+            test_fn()
+            total_passed += 1
+        except AssertionError:
+            total_failed += 1
 
     print(f"\n{'='*50}")
     color = GREEN if total_failed == 0 else RED
