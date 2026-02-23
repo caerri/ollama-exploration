@@ -13,7 +13,7 @@ import requests
 
 from config import (
     get_env,
-    DIM, BOLD, RESET, CYAN, GREEN, YELLOW, RED, MAGENTA, BLUE,
+    DIM, BOLD, RESET, CYAN, GREEN, YELLOW, RED, MAGENTA, BLUE, LOCAL_COLOR,
     MODEL_MAP, MODEL_PROVIDER, COST_INFO, MODEL_SHORTCUTS, RESPONSES_API_MODELS,
     REMOTE_SYSTEM_PROMPT,
 )
@@ -205,13 +205,13 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
             retry_raw = call_ollama(retry_prompt)
             retry_parsed = parse_local_response(retry_raw)
             output = retry_parsed["OUTPUT"]
-        local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+        local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
         print(f"\n{DIM}[{local_model}]{RESET}")
-        print(f"{BOLD}{output}{RESET}")
+        print(f"{LOCAL_COLOR}{output}{RESET}")
         return
 
     if next_step == "ASK_USER":
-        local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+        local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
         print(f"\n{DIM}[{local_model}]{RESET}")
         print(f"{YELLOW}{parsed['OUTPUT']}{RESET}")
         return
@@ -281,14 +281,14 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
                                       f"You suggested sending this to the remote model, but the user "
                                       f"declined. Answer the question yourself to the best of your ability. "
                                       f"Set next_step to RESPOND_LOCALLY.")
-                _retry_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+                _retry_model = get_env("OLLAMA_MODEL", "gemma2:9b")
                 print(f"\n{CYAN}--- {_retry_model} (local retry) ---{RESET}")
                 retry_raw = call_ollama(local_retry_prompt, show_stream=True)
                 try:
                     retry_parsed = parse_local_response(retry_raw)
-                    local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+                    local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
                     print(f"\n{DIM}[{local_model}]{RESET}")
-                    print(f"{BOLD}{retry_parsed['OUTPUT']}{RESET}")
+                    print(f"{LOCAL_COLOR}{retry_parsed['OUTPUT']}{RESET}")
                 except (ValueError, json.JSONDecodeError):
                     print(f"\n{YELLOW}[NOTE] Couldn't parse retry — here's the raw response{RESET}")
                     print(retry_raw)
@@ -323,7 +323,7 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
 # REPL — the user-facing loop
 # ---------------------------------------------------------------------------
 def main() -> None:
-    local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+    local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
     escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
     print(f"{BOLD}{CYAN}Relay v2: Local (Ollama) → Remote (Claude / GPT){RESET}")
     print(f"{DIM}  Local:     @llama  @deepseek{RESET}")
@@ -427,12 +427,12 @@ def main() -> None:
         # --- Direct @llama: force local model ---
         if force_llama:
             try:
-                local_model_name = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+                local_model_name = get_env("OLLAMA_MODEL", "gemma2:9b")
                 print(f"\n{CYAN}--- {local_model_name} (local) ---{RESET}")
                 local_raw = call_ollama(user_input, show_stream=True)
                 parsed = parse_local_response(local_raw)
                 print(f"\n{DIM}[{local_model_name}]{RESET}")
-                print(f"{BOLD}{parsed['OUTPUT']}{RESET}")
+                print(f"{LOCAL_COLOR}{parsed['OUTPUT']}{RESET}")
             except (ValueError, json.JSONDecodeError):
                 print(f"{YELLOW}[Couldn't parse response]{RESET}")
             continue

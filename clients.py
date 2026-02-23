@@ -26,7 +26,7 @@ def call_ollama(prompt: str, show_stream: bool = False) -> str:
     user can see the model "thinking".
     """
     base_url = get_env("OLLAMA_BASE_URL", "http://localhost:11434")
-    model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+    model = get_env("OLLAMA_MODEL", "gemma2:9b")
     url = f"{base_url.rstrip('/')}/api/chat"
 
     # Add current message to history

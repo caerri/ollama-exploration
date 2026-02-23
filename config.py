@@ -25,6 +25,7 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 MAGENTA = "\033[35m"
 BLUE = "\033[38;5;111m"
+LOCAL_COLOR = "\033[38;5;252m"  # soft white — distinct from user text
 
 
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
