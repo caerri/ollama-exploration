@@ -19,6 +19,50 @@ from conversation import conversation_history, add_message, _trim_history
 # Ollama (local models)
 # ---------------------------------------------------------------------------
 
+def get_ollama_models() -> dict[str, str]:
+    """Query Ollama for installed models and build a shortcut map.
+
+    Returns a dict like {"mistral": "mistral-nemo:12b", "gemma": "gemma2:9b", ...}
+    where keys are short trigger names derived from the model name.
+    """
+    base_url = get_env("OLLAMA_BASE_URL", "http://localhost:11434")
+    try:
+        resp = requests.get(f"{base_url.rstrip('/')}/api/tags", timeout=5)
+        resp.raise_for_status()
+    except requests.RequestException:
+        return {}
+
+    shortcuts: dict[str, str] = {}
+    for model_info in resp.json().get("models", []):
+        full_name = model_info["name"]          # e.g. "mistral-nemo:12b"
+        base = full_name.split(":")[0]          # e.g. "mistral-nemo"
+
+        # Add the full base as a shortcut: "mistral-nemo" → "mistral-nemo:12b"
+        shortcuts[base] = full_name
+
+        # Add the first word as a shortcut: "mistral" → "mistral-nemo:12b"
+        # But only if it doesn't collide with an existing (longer) name
+        first_word = base.split("-")[0]
+        if first_word not in shortcuts:
+            shortcuts[first_word] = full_name
+
+        # Also handle dots: "llama3.1" → first word "llama3" and "llama"
+        if "." in first_word:
+            prefix = first_word.split(".")[0]   # "llama3"
+            if prefix not in shortcuts:
+                shortcuts[prefix] = full_name
+            # Strip trailing digits from the prefix too: "llama3" → "llama"
+            clean_prefix = prefix.rstrip("0123456789")
+            if clean_prefix and clean_prefix != prefix and clean_prefix not in shortcuts:
+                shortcuts[clean_prefix] = full_name
+        else:
+            # Strip trailing digits for a clean shortcut: "gemma2" → "gemma"
+            clean = first_word.rstrip("0123456789")
+            if clean and clean != first_word and clean not in shortcuts:
+                shortcuts[clean] = full_name
+
+    return shortcuts
+
 def call_ollama(prompt: str, show_stream: bool = False) -> str:
     """Send a message to Ollama using the chat API (supports conversation history).
 

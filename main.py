@@ -23,7 +23,7 @@ from conversation import (
     parse_local_response, print_local_summary,
 )
 from clients import (
-    call_ollama, call_ollama_direct,
+    call_ollama, call_ollama_direct, get_ollama_models,
     call_anthropic_stream, call_openai_stream, call_openai_responses_stream,
     unload_model,
 )
@@ -325,8 +325,21 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
 def main() -> None:
     local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
     escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
+
+    # Discover installed Ollama models and build @trigger shortcuts
+    ollama_shortcuts = get_ollama_models()
+    # For display, show shortest alias → full model name
+    _seen_models: dict[str, str] = {}  # full_name → shortest shortcut
+    for shortcut, full_name in ollama_shortcuts.items():
+        if full_name not in _seen_models or len(shortcut) < len(_seen_models[full_name]):
+            _seen_models[full_name] = shortcut
+    local_triggers = "  ".join(
+        f"@{s} ({fn.split(':')[1]})" if ':' in fn else f"@{s}"
+        for fn, s in sorted(_seen_models.items(), key=lambda x: x[1])
+    )
+
     print(f"{BOLD}{CYAN}Relay v2: Local (Ollama) → Remote (Claude / GPT){RESET}")
-    print(f"{DIM}  Local:     @llama  @deepseek{RESET}")
+    print(f"{DIM}  Local:     {local_triggers}{RESET}")
     print(f"{DIM}  Anthropic: @haiku  @sonnet  @opus{RESET}")
     print(f"{DIM}  OpenAI:    @mini   @gpt     @gpt_pro{RESET}")
     print(f"{DIM}  Commands:  clear   exit{RESET}\n")
@@ -349,92 +362,89 @@ def main() -> None:
 
         # Detect explicit model triggers
         force_remote = False
-        force_deepseek = False
-        force_llama = False
-        force_model: str | None = None
+        force_local_model: str | None = None   # full Ollama model name (e.g. "mistral-nemo:12b")
+        force_model: str | None = None          # remote model canonical key (e.g. "HAIKU")
         lower_input = user_input.lower()
 
-        # @deepseek — skip llama, go straight to deepseek
-        if "@deepseek" in lower_input:
-            force_deepseek = True
-            user_input = user_input[:lower_input.index("@deepseek")] + user_input[lower_input.index("@deepseek") + len("@deepseek"):]
-            user_input = user_input.strip()
-            if not user_input:
-                print(f"{YELLOW}Usage: @deepseek <your question>{RESET}")
-                continue
-
-        # @llama — force local model (no escalation, no remote)
-        elif "@llama" in lower_input:
-            force_llama = True
-            user_input = user_input[:lower_input.index("@llama")] + user_input[lower_input.index("@llama") + len("@llama"):]
-            user_input = user_input.strip()
-            if not user_input:
-                print(f"{YELLOW}Usage: @llama <your question>{RESET}")
-                continue
-
-        # @haiku, @sonnet, @gpt, @mini etc — skip llama, go straight to remote
-        elif any(f"@{s}" in lower_input for s in MODEL_SHORTCUTS):
-            _matched_empty = False
-            # Sort by length descending so @gpt_pro matches before @gpt
-            for shortcut, canonical in sorted(MODEL_SHORTCUTS.items(), key=lambda x: len(x[0]), reverse=True):
-                trigger = f"@{shortcut}"
-                if trigger in lower_input:
-                    force_remote = True
-                    force_model = canonical
-                    user_input = user_input[:lower_input.index(trigger)] + user_input[lower_input.index(trigger) + len(trigger):]
-                    user_input = user_input.strip()
-                    if not user_input:
-                        print(f"{YELLOW}Usage: {trigger} <your question>{RESET}")
-                        _matched_empty = True
+        # --- Check for @<local-ollama-model> triggers ---
+        # Sort by shortcut length descending so "mistral-nemo" matches before "mistral"
+        _local_matched = False
+        for shortcut, full_model_name in sorted(
+            ollama_shortcuts.items(), key=lambda x: len(x[0]), reverse=True
+        ):
+            trigger = f"@{shortcut}"
+            if trigger in lower_input:
+                idx = lower_input.index(trigger)
+                user_input = (user_input[:idx] + user_input[idx + len(trigger):]).strip()
+                if not user_input:
+                    print(f"{YELLOW}Usage: {trigger} <your question>{RESET}")
+                    _local_matched = True
                     break
-            if _matched_empty:
-                continue
+                force_local_model = full_model_name
+                _local_matched = True
+                break
+        if _local_matched and not force_local_model:
+            continue  # empty usage — go back to prompt
 
-        # "phone a friend" — force remote (llama still picks the model)
-        elif "phone a friend" in lower_input:
-            user_input = user_input[:lower_input.index("phone a friend")] + user_input[lower_input.index("phone a friend") + len("phone a friend"):]
-            user_input = user_input.strip()
-            if not user_input:
-                print(f"{YELLOW}Usage: phone a friend <your question>{RESET}")
-                print(f"{DIM}Or tag a model directly: @haiku @sonnet @gpt @mini{RESET}")
-            else:
-                force_remote = True
-            if not force_remote:
-                continue
+        # --- Check for @<remote-model> triggers (haiku, sonnet, gpt, etc.) ---
+        if not force_local_model:
+            if any(f"@{s}" in lower_input for s in MODEL_SHORTCUTS):
+                _matched_empty = False
+                # Sort by length descending so @gpt_pro matches before @gpt
+                for shortcut, canonical in sorted(MODEL_SHORTCUTS.items(), key=lambda x: len(x[0]), reverse=True):
+                    trigger = f"@{shortcut}"
+                    if trigger in lower_input:
+                        force_remote = True
+                        force_model = canonical
+                        user_input = user_input[:lower_input.index(trigger)] + user_input[lower_input.index(trigger) + len(trigger):]
+                        user_input = user_input.strip()
+                        if not user_input:
+                            print(f"{YELLOW}Usage: {trigger} <your question>{RESET}")
+                            _matched_empty = True
+                        break
+                if _matched_empty:
+                    continue
 
-        # --- Direct @deepseek: skip everything, go straight to deepseek ---
-        if force_deepseek:
-            escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
-            if not escalation_model:
-                print(f"{YELLOW}No escalation model configured (OLLAMA_ESCALATION_MODEL is empty){RESET}")
+            # "phone a friend" — force remote (llama still picks the model)
+            elif "phone a friend" in lower_input:
+                user_input = user_input[:lower_input.index("phone a friend")] + user_input[lower_input.index("phone a friend") + len("phone a friend"):]
+                user_input = user_input.strip()
+                if not user_input:
+                    print(f"{YELLOW}Usage: phone a friend <your question>{RESET}")
+                    print(f"{DIM}Or tag a model directly: @haiku @sonnet @gpt @mini{RESET}")
+                else:
+                    force_remote = True
+                if not force_remote:
+                    continue
+
+        # --- Direct @<local-model>: skip routing, go straight to that Ollama model ---
+        if force_local_model:
+            default_model = get_env("OLLAMA_MODEL", "gemma2:9b")
+            if force_local_model == default_model:
+                # User tagged the default model — use call_ollama (JSON routing mode)
+                try:
+                    print(f"\n{CYAN}--- {default_model} (local) ---{RESET}")
+                    local_raw = call_ollama(user_input, show_stream=True)
+                    parsed = parse_local_response(local_raw)
+                    print(f"\n{DIM}[{default_model}]{RESET}")
+                    print(f"{LOCAL_COLOR}{parsed['OUTPUT']}{RESET}")
+                except (ValueError, json.JSONDecodeError):
+                    print(f"{YELLOW}[Couldn't parse response]{RESET}")
             else:
-                # Record the user's question so future turns have context
+                # Non-default local model — use call_ollama_direct (free-form)
                 add_message("user", user_input)
-                print(f"\n{CYAN}--- {escalation_model} (local) ---{RESET}")
+                print(f"\n{CYAN}--- {force_local_model} (local) ---{RESET}")
                 digest = build_conversation_digest()
                 prompt_parts: list[str] = []
                 if digest:
                     prompt_parts.append(digest)
                 prompt_parts.append(user_input)
                 full_prompt = "\n\n".join(prompt_parts)
-                response = call_ollama_direct(full_prompt, model=escalation_model, show_stream=True)
-                if response:
-                    print(f"{DIM}[{escalation_model}]{RESET}")
+                resp = call_ollama_direct(full_prompt, model=force_local_model, show_stream=True)
+                if resp:
+                    print(f"{DIM}[{force_local_model}]{RESET}")
                 else:
-                    print(f"{YELLOW}[No response from {escalation_model}]{RESET}")
-            continue
-
-        # --- Direct @llama: force local model ---
-        if force_llama:
-            try:
-                local_model_name = get_env("OLLAMA_MODEL", "gemma2:9b")
-                print(f"\n{CYAN}--- {local_model_name} (local) ---{RESET}")
-                local_raw = call_ollama(user_input, show_stream=True)
-                parsed = parse_local_response(local_raw)
-                print(f"\n{DIM}[{local_model_name}]{RESET}")
-                print(f"{LOCAL_COLOR}{parsed['OUTPUT']}{RESET}")
-            except (ValueError, json.JSONDecodeError):
-                print(f"{YELLOW}[Couldn't parse response]{RESET}")
+                    print(f"{YELLOW}[No response from {force_local_model}]{RESET}")
             continue
 
         # --- Direct @model: skip llama entirely, go straight to remote ---
