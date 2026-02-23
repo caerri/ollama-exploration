@@ -43,7 +43,7 @@ def call_ollama(prompt: str, show_stream: bool = False) -> str:
             "stream": True,
             "options": {
                 "num_ctx": 8192,
-                "num_predict": 2048,
+                "num_predict": 4096,
             },
         },
         timeout=300,
@@ -99,7 +99,7 @@ def call_ollama_direct(prompt: str, model: str | None = None, show_stream: bool 
                 "stream": True,
                 "options": {
                     "num_ctx": 8192,
-                    "num_predict": 2048,
+                    "num_predict": 4096,
                 },
             },
             timeout=300,

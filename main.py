@@ -133,7 +133,7 @@ def send_to_remote(user_input: str, model_choice: str) -> None:
 # ---------------------------------------------------------------------------
 def relay_once(user_input: str, force_remote: bool = False, force_model: str | None = None) -> None:
     """Main relay: run llama for routing, then dispatch accordingly."""
-    _local_model_name = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+    _local_model_name = get_env("OLLAMA_MODEL", "gemma2:9b")
     print(f"\n{CYAN}--- {_local_model_name} (local) ---{RESET}")
     local_raw = call_ollama(user_input, show_stream=True)
 
@@ -189,10 +189,11 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
             looks_truncated = True
 
         # Check 2: response ends mid-sentence (no terminal punctuation)
+        # But skip if response is long enough — it's probably a signature/name ending
         stripped = output.rstrip()
         if (stripped
-                and len(stripped) > 200
-                and stripped[-1] not in ".!?\"')]}\u201d"):
+                and 200 < len(stripped) < 800
+                and stripped[-1] not in ".!?\"')]}\u201d\n"):
             looks_truncated = True
 
         if looks_truncated:
