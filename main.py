@@ -15,8 +15,9 @@ from config import (
     get_env,
     DIM, BOLD, RESET, CYAN, GREEN, YELLOW, RED, MAGENTA, BLUE, LOCAL_COLOR,
     MODEL_MAP, MODEL_PROVIDER, COST_INFO, MODEL_SHORTCUTS, RESPONSES_API_MODELS,
-    REMOTE_SYSTEM_PROMPT,
+    REMOTE_SYSTEM_PROMPT, CALENDAR_KEYWORDS,
 )
+from calendar_client import get_calendar_context
 from conversation import (
     conversation_history, add_message, clear_history,
     build_conversation_digest, build_remote_messages,
@@ -342,7 +343,7 @@ def main() -> None:
     print(f"{DIM}  Local:     {local_triggers}{RESET}")
     print(f"{DIM}  Anthropic: @haiku  @sonnet  @opus{RESET}")
     print(f"{DIM}  OpenAI:    @mini   @gpt     @gpt_pro{RESET}")
-    print(f"{DIM}  Commands:  clear   exit{RESET}\n")
+    print(f"{DIM}  Commands:  cal   clear   exit{RESET}\n")
 
     while True:
         # Flush any leftover bytes in stdin (e.g. from a multi-line paste)
@@ -358,6 +359,13 @@ def main() -> None:
         if user_input.lower() == "clear":
             clear_history()
             print(f"{CYAN}[Conversation cleared]{RESET}")
+            continue
+        if user_input.lower() in {"cal", "calendar"}:
+            cal_ctx = get_calendar_context()
+            if cal_ctx:
+                print(f"\n{CYAN}{cal_ctx}{RESET}")
+            else:
+                print(f"{YELLOW}[No calendar access — check System Settings → Privacy & Security → Calendars]{RESET}")
             continue
 
         # Detect explicit model triggers
@@ -459,6 +467,14 @@ def main() -> None:
             except Exception as err:  # noqa: BLE001
                 print(f"{RED}[UNEXPECTED ERROR] {err}{RESET}")
             continue
+
+        # --- Calendar context injection ---
+        # If the user's message mentions calendar-related keywords, fetch
+        # the schedule and prepend it so the model can answer with real data.
+        if any(kw in lower_input for kw in CALENDAR_KEYWORDS):
+            cal_ctx = get_calendar_context()
+            if cal_ctx:
+                user_input = f"{cal_ctx}\n\n{user_input}"
 
         # --- Default path: llama routes ---
         try:

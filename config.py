@@ -38,6 +38,17 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
 # Keep last 40 entries (~20 exchanges) so remote models see enough context
 MAX_HISTORY = 40
 
+# Calendar: how many days ahead to fetch events
+CALENDAR_LOOKAHEAD_DAYS = 7
+
+# Keywords that trigger automatic calendar context injection
+CALENDAR_KEYWORDS = [
+    "calendar", "schedule", "meeting", "meetings",
+    "free", "busy", "appointment", "what's on my",
+    "what do i have", "am i free", "my week", "my day",
+    "today's schedule", "tomorrow's schedule",
+]
+
 
 _LOCAL_MODEL = get_env("OLLAMA_MODEL", "gemma2:9b")
 
