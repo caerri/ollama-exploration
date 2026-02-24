@@ -24,7 +24,7 @@ _cache: tuple[float, str] = (0.0, "")
 _CACHE_TTL = 300  # 5 minutes
 
 # Max characters per section before truncation
-_SECTION_MAX_CHARS = 150
+_SECTION_MAX_CHARS = 300
 
 
 def _parse_daily_note(path: Path) -> dict | None:

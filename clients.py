@@ -11,7 +11,8 @@ import requests
 from anthropic import Anthropic
 from openai import OpenAI
 
-from config import get_env, LOCAL_SYSTEM_PROMPT, DIM, RESET, GREEN, BLUE
+from config import get_env, DIM, RESET, GREEN, BLUE
+from prompts import build_system_prompt
 from conversation import conversation_history, add_message, _trim_history
 
 
@@ -63,11 +64,13 @@ def get_ollama_models() -> dict[str, str]:
 
     return shortcuts
 
-def call_ollama(prompt: str, show_stream: bool = False) -> str:
+def call_ollama(prompt: str, show_stream: bool = False,
+                system_prompt: str | None = None) -> str:
     """Send a message to Ollama using the chat API (supports conversation history).
 
     If show_stream is True, tokens are printed to stdout as they arrive so the
-    user can see the model "thinking".
+    user can see the model "thinking".  Pass system_prompt to override the
+    default base prompt (e.g. with context-aware prompt).
     """
     base_url = get_env("OLLAMA_BASE_URL", "http://localhost:11434")
     model = get_env("OLLAMA_MODEL", "gemma2:9b")
@@ -76,7 +79,8 @@ def call_ollama(prompt: str, show_stream: bool = False) -> str:
     # Add current message to history
     conversation_history.append({"role": "user", "content": prompt})
 
-    messages = [{"role": "system", "content": LOCAL_SYSTEM_PROMPT}] + conversation_history
+    effective_prompt = system_prompt or build_system_prompt()
+    messages = [{"role": "system", "content": effective_prompt}] + conversation_history
 
     response = requests.post(
         url,

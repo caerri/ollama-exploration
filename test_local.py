@@ -11,6 +11,7 @@ Tests cover:
   8. Natural conversation flow — multi-turn scenarios that broke in real usage
   9. Journal keyword detection — matching logic for Obsidian journal injection
  10. Journal template parsing — YAML frontmatter + markdown section extraction
+ 11. Prompt composition — modular prompt building and sticky context detection
 """
 
 from __future__ import annotations
@@ -1289,7 +1290,7 @@ def test_journal_parsing():
             # The formatted "Happened:" line should be truncated
             for line in formatted.split("\n"):
                 if "Happened:" in line:
-                    assert len(line) < 200, f"line too long: {len(line)} chars"
+                    assert len(line) < 350, f"line too long: {len(line)} chars"
                     assert line.rstrip().endswith("...")
                     break
             _pass("10e. Long section content truncated with ..."); passed += 1
@@ -1378,7 +1379,120 @@ def test_journal_parsing():
         except Exception as e:
             _fail("10j. Context format structure", str(e)); failed += 1
 
+    # --- 10k. Non-numeric mood/energy values handled correctly ---
+    with tempfile.TemporaryDirectory() as tmpdir:
+        note = Path(tmpdir) / "2026-02-22.md"
+        note.write_text(
+            "---\ndate: \"2026-02-22\"\nmood: mixed\nenergy: low\nsleep_hours: 7\n---\n\n"
+            "## What Happened\nTesting descriptive mood values.\n"
+        )
+        try:
+            parsed = _parse_daily_note(note)
+            assert parsed["frontmatter"]["mood"] == "mixed"
+            assert parsed["frontmatter"]["energy"] == "low"
+            formatted = _format_entry(parsed)
+            assert "mood:mixed" in formatted
+            assert "energy:low" in formatted
+            _pass("10k. Non-numeric mood/energy handled"); passed += 1
+        except Exception as e:
+            _fail("10k. Non-numeric mood/energy", str(e)); failed += 1
+
     assert failed == 0, f"{failed} journal_parsing sub-tests failed"
+
+
+# ======================================================================
+# 11. Prompt Composition + Sticky Context Detection
+# ======================================================================
+
+def test_prompt_composition():
+    _section("11. Prompt Composition + Sticky Context")
+    passed = 0
+    failed = 0
+
+    from prompts import build_system_prompt, has_recent_context, PROMPT_CONTEXT
+
+    # --- 11a. Base prompt has core sections, no context analysis ---
+    try:
+        base = build_system_prompt(has_context=False)
+        assert "TONE" in base, "base prompt should have TONE"
+        assert "JSON OUTPUT" in base, "base prompt should have JSON OUTPUT"
+        assert "ROUTING" in base, "base prompt should have ROUTING"
+        assert "RESPONSE QUALITY" in base, "base prompt should have RESPONSE QUALITY"
+        assert "PERSONAL CONTEXT ANALYSIS MODE" not in base, \
+            "base prompt should NOT have context analysis"
+        _pass("11a. Base prompt has core sections, no context"); passed += 1
+    except Exception as e:
+        _fail("11a. Base prompt structure", str(e)); failed += 1
+
+    # --- 11b. Context prompt includes analysis steps ---
+    try:
+        ctx = build_system_prompt(has_context=True)
+        assert "PERSONAL CONTEXT ANALYSIS MODE" in ctx
+        assert "STEP 1" in ctx
+        assert "STEP 2" in ctx
+        assert "STEP 3" in ctx
+        assert "STEP 4" in ctx
+        assert "DATA INVENTORY" in ctx
+        assert "PATTERN DETECTION" in ctx
+        assert "CALENDAR vs REALITY" in ctx
+        assert "CONCRETE RECOMMENDATIONS" in ctx
+        _pass("11b. Context prompt includes all analysis steps"); passed += 1
+    except Exception as e:
+        _fail("11b. Context prompt analysis steps", str(e)); failed += 1
+
+    # --- 11c. Context prompt is longer than base ---
+    try:
+        base = build_system_prompt(has_context=False)
+        ctx = build_system_prompt(has_context=True)
+        assert len(ctx) > len(base), \
+            f"context ({len(ctx)}) should be longer than base ({len(base)})"
+        _pass("11c. Context prompt longer than base"); passed += 1
+    except Exception as e:
+        _fail("11c. Prompt length comparison", str(e)); failed += 1
+
+    # --- 11d. has_recent_context detects markers in history ---
+    try:
+        history_with_context = [
+            {"role": "user", "content": "--- Your Calendar ---\nMonday: meeting at 2pm"},
+            {"role": "assistant", "content": '{"output": "you have a meeting"}'},
+        ]
+        assert has_recent_context(history_with_context) is True
+        _pass("11d. has_recent_context detects calendar marker"); passed += 1
+    except Exception as e:
+        _fail("11d. Context marker detection", str(e)); failed += 1
+
+    # --- 11e. has_recent_context returns False for empty/normal history ---
+    try:
+        empty_history: list[dict[str, str]] = []
+        assert has_recent_context(empty_history) is False
+
+        normal_history = [
+            {"role": "user", "content": "hey what's up"},
+            {"role": "assistant", "content": '{"output": "not much"}'},
+        ]
+        assert has_recent_context(normal_history) is False
+        _pass("11e. No false positives on normal history"); passed += 1
+    except Exception as e:
+        _fail("11e. No false positives", str(e)); failed += 1
+
+    # --- 11f. has_recent_context respects lookback window ---
+    try:
+        # Context marker is at the start, but lookback=2 only checks last 2 messages
+        old_context_history = [
+            {"role": "user", "content": "--- Your Journal ---\nmood: 3"},
+            {"role": "assistant", "content": "noted"},
+            {"role": "user", "content": "tell me a joke"},
+            {"role": "assistant", "content": "why did the chicken"},
+            {"role": "user", "content": "that sucked"},
+            {"role": "assistant", "content": "fair enough"},
+        ]
+        assert has_recent_context(old_context_history, lookback=2) is False
+        assert has_recent_context(old_context_history, lookback=10) is True
+        _pass("11f. Lookback window respected"); passed += 1
+    except Exception as e:
+        _fail("11f. Lookback window", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} prompt_composition sub-tests failed"
 
 
 # ======================================================================
@@ -1387,7 +1501,7 @@ def test_journal_parsing():
 
 def main():
     print(f"{BOLD}{CYAN}Local Test Suite — No API Calls{RESET}")
-    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, calendar, and journal{RESET}")
+    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, calendar, journal, and prompts{RESET}")
 
     total_passed = 0
     total_failed = 0
@@ -1403,6 +1517,7 @@ def main():
         test_natural_conversation_flow,
         test_journal_keywords,
         test_journal_parsing,
+        test_prompt_composition,
     ]:
         try:
             test_fn()

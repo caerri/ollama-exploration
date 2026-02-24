@@ -15,8 +15,9 @@ from config import (
     get_env,
     DIM, BOLD, RESET, CYAN, GREEN, YELLOW, RED, MAGENTA, BLUE, LOCAL_COLOR,
     MODEL_MAP, MODEL_PROVIDER, COST_INFO, MODEL_SHORTCUTS, RESPONSES_API_MODELS,
-    REMOTE_SYSTEM_PROMPT, CALENDAR_KEYWORDS, JOURNAL_KEYWORDS,
+    CALENDAR_KEYWORDS, JOURNAL_KEYWORDS,
 )
+from prompts import build_system_prompt, has_recent_context, REMOTE_SYSTEM_PROMPT
 from calendar_client import get_calendar_context
 from obsidian_client import get_journal_context
 from conversation import (
@@ -133,11 +134,13 @@ def send_to_remote(user_input: str, model_choice: str) -> None:
 # ---------------------------------------------------------------------------
 # Main relay: llama routes, then dispatch
 # ---------------------------------------------------------------------------
-def relay_once(user_input: str, force_remote: bool = False, force_model: str | None = None) -> None:
+def relay_once(user_input: str, force_remote: bool = False,
+               force_model: str | None = None,
+               system_prompt: str | None = None) -> None:
     """Main relay: run llama for routing, then dispatch accordingly."""
     _local_model_name = get_env("OLLAMA_MODEL", "gemma2:9b")
     print(f"\n{CYAN}--- {_local_model_name} (local) ---{RESET}")
-    local_raw = call_ollama(user_input, show_stream=True)
+    local_raw = call_ollama(user_input, show_stream=True, system_prompt=system_prompt)
 
     try:
         parsed = parse_local_response(local_raw)
@@ -148,7 +151,7 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
                         f"Your previous answer was too long and got cut off. "
                         f"Give a SHORTER but still complete answer. "
                         f"Keep the output field under 1500 characters.")
-        retry_raw = call_ollama(retry_prompt)
+        retry_raw = call_ollama(retry_prompt, system_prompt=system_prompt)
         parsed = parse_local_response(retry_raw)
 
     # Python-side override: if the user is complaining about routing, force local
@@ -204,7 +207,7 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
                             f"You started to answer but got cut off. "
                             f"Please give the FULL complete answer in the output field. "
                             f"Make sure to finish your thought completely.")
-            retry_raw = call_ollama(retry_prompt)
+            retry_raw = call_ollama(retry_prompt, system_prompt=system_prompt)
             retry_parsed = parse_local_response(retry_raw)
             output = retry_parsed["OUTPUT"]
         local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
@@ -285,7 +288,8 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
                                       f"Set next_step to RESPOND_LOCALLY.")
                 _retry_model = get_env("OLLAMA_MODEL", "gemma2:9b")
                 print(f"\n{CYAN}--- {_retry_model} (local retry) ---{RESET}")
-                retry_raw = call_ollama(local_retry_prompt, show_stream=True)
+                retry_raw = call_ollama(local_retry_prompt, show_stream=True,
+                                       system_prompt=system_prompt)
                 try:
                     retry_parsed = parse_local_response(retry_raw)
                     local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
@@ -303,7 +307,7 @@ def relay_once(user_input: str, force_remote: bool = False, force_model: str | N
                                   f"more context first. Ask the user a clarifying question that would "
                                   f"help you either answer locally or build a better remote prompt. "
                                   f"Set next_step to ASK_USER.")
-                clarify_raw = call_ollama(clarify_prompt)
+                clarify_raw = call_ollama(clarify_prompt, system_prompt=system_prompt)
                 try:
                     clarify_parsed = parse_local_response(clarify_raw)
                     print(f"\n{YELLOW}{clarify_parsed['OUTPUT']}{RESET}")
@@ -479,8 +483,11 @@ def main() -> None:
         # --- Context injection (calendar + journal) ---
         # Either keyword list triggers loading BOTH context sources together,
         # so the model sees schedule + journal entries side by side.
+        # Sticky: if recent history already has context data, stay in context mode.
         cal_match = any(kw in lower_input for kw in CALENDAR_KEYWORDS)
         journal_match = any(kw in lower_input for kw in JOURNAL_KEYWORDS)
+        has_context = cal_match or journal_match or has_recent_context(conversation_history)
+
         if cal_match or journal_match:
             context_parts = []
             cal_ctx = get_calendar_context()
@@ -492,9 +499,11 @@ def main() -> None:
             if context_parts:
                 user_input = "\n\n".join(context_parts) + "\n\n" + user_input
 
+        system_prompt = build_system_prompt(has_context=has_context) if has_context else None
+
         # --- Default path: llama routes ---
         try:
-            relay_once(user_input, force_remote=force_remote)
+            relay_once(user_input, force_remote=force_remote, system_prompt=system_prompt)
         except (requests.RequestException, ValueError) as err:
             print(f"{RED}[ERROR] {err}{RESET}")
         except Exception as err:  # noqa: BLE001
