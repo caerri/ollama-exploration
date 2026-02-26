@@ -71,6 +71,13 @@ JOURNAL_KEYWORDS = [
     "should i take", "can i handle", "am i overloaded",
 ]
 
+# Keywords that trigger Canvas assignment context injection
+CANVAS_KEYWORDS = [
+    "canvas", "assignment", "assignments", "due", "deadline",
+    "deadlines", "homework", "what's due", "whats due",
+    "school", "grades", "syllabus", "coursework",
+]
+
 
 # --- Model configuration ---
 

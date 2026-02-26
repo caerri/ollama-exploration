@@ -196,7 +196,7 @@ def build_system_prompt(has_context: bool = False) -> str:
 # Sticky context detection
 # ---------------------------------------------------------------------------
 
-CONTEXT_MARKERS = ("--- Your Calendar ---", "--- Your Journal ---")
+CONTEXT_MARKERS = ("--- Your Calendar ---", "--- Your Journal ---", "--- Your Assignments ---")
 
 
 def has_recent_context(history: list[dict[str, str]], lookback: int = 10) -> bool:
