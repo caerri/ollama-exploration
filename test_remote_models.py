@@ -8,7 +8,8 @@ One call per paid model. Evaluates whether they get enough context.
 from __future__ import annotations
 
 import json
-from config import get_env, MODEL_MAP, REMOTE_SYSTEM_PROMPT, BOLD, RESET, DIM, CYAN, GREEN, BLUE, MAGENTA, YELLOW
+from config import get_env, MODEL_MAP, BOLD, RESET, DIM, CYAN, GREEN, BLUE, MAGENTA, YELLOW
+from prompts import REMOTE_SYSTEM_PROMPT
 from conversation import (
     conversation_history, add_message, clear_history,
     build_remote_messages,
@@ -20,7 +21,7 @@ def simulate_conversation():
     """Build a realistic multi-turn conversation history as the app would."""
     clear_history()
 
-    # Turn 1: User greets, llama responds locally
+    # Turn 1: User greets, local model responds locally
     add_message("user", "hey! i'm working on a python web scraper and running into issues")
     add_message("assistant", json.dumps({
         "analysis": "user needs help with a python web scraper",
@@ -30,7 +31,7 @@ def simulate_conversation():
         "output": "Hey! I'd be happy to help with your web scraper. What kind of issues are you running into? Are you getting errors, or is the scraper not pulling the data you expect?"
     }))
 
-    # Turn 2: User gives details, llama responds locally
+    # Turn 2: User gives details, local model responds locally
     add_message("user", "i'm using beautifulsoup to scrape product prices from an ecommerce site but the prices show up as empty. the page loads them with javascript.")
     add_message("assistant", json.dumps({
         "analysis": "user's scraper can't get JS-rendered content with beautifulsoup",
@@ -40,7 +41,7 @@ def simulate_conversation():
         "output": "That's a classic issue! BeautifulSoup only parses the static HTML — it can't execute JavaScript. The prices are probably loaded dynamically after the page loads. You have a few options: you could use Selenium or Playwright to render the JS first, or you could check if the site has an API endpoint that returns the price data directly (check the Network tab in dev tools). Which approach sounds better for your use case?"
     }))
 
-    # Turn 3: User asks follow-up, llama routes to remote
+    # Turn 3: User asks follow-up, local model routes to remote
     add_message("user", "i want to try playwright. can you give me a working example that scrapes prices from a page with dynamic content? also how do i handle pagination?")
     add_message("assistant", json.dumps({
         "analysis": "user wants a complete playwright example with pagination",

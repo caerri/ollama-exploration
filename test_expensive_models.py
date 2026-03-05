@@ -15,9 +15,10 @@ import json
 import sys
 
 from config import (
-    get_env, MODEL_MAP, REMOTE_SYSTEM_PROMPT, RESPONSES_API_MODELS,
+    get_env, MODEL_MAP, RESPONSES_API_MODELS,
     BOLD, RESET, DIM, CYAN, GREEN, YELLOW, RED, MAGENTA,
 )
+from prompts import REMOTE_SYSTEM_PROMPT
 from conversation import (
     conversation_history, add_message, clear_history,
     build_remote_messages,

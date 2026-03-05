@@ -3,8 +3,6 @@
 Exports:
   get_canvas_context(days)  — formatted text block of upcoming assignments
   sync_courses(vault_path)  — full course mirror to Obsidian vault
-  list_courses()            — active courses (for debugging/REPL)
-
 All Canvas API access is isolated here. The sync writes deterministic
 markdown files to the vault — no LLM is involved in the output.
 """
@@ -15,7 +13,6 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
 from markdownify import markdownify as md
@@ -27,6 +24,14 @@ from config import get_env
 # ---------------------------------------------------------------------------
 _cache: tuple[float, str] = (0.0, "")
 _CACHE_TTL = 300  # 5 minutes
+
+# Active course IDs — only these are included in context and sync.
+# Set CANVAS_ACTIVE_COURSES in .env as comma-separated IDs.
+# If empty/unset, all courses with "active" enrollment are included.
+_ACTIVE_COURSE_IDS: set[int] = set()
+_raw = get_env("CANVAS_ACTIVE_COURSES", "")
+if _raw.strip():
+    _ACTIVE_COURSE_IDS = {int(x.strip()) for x in _raw.split(",") if x.strip()}
 
 
 # ---------------------------------------------------------------------------
@@ -138,23 +143,30 @@ def _short_course_name(full_name: str) -> str:
 # Public: context injection for relay app
 # ---------------------------------------------------------------------------
 
-def get_canvas_context(days: int | None = None) -> str:
+def get_canvas_context(days: int | None = None, rich: bool = False) -> str:
     """Fetch upcoming assignments and return a formatted text block.
 
+    If rich=False (default), returns compact format (name/due/points).
+    If rich=True, includes assignment descriptions so remote models
+    can estimate time requirements and give specific advice.
+
     Returns empty string if API unavailable or no active courses.
-    Results are cached for 5 minutes.
+    Results are cached for 5 minutes (compact and rich cached separately).
     """
     if days is None:
         days = 14
 
     global _cache
     now = time.time()
-    if _cache[1] and (now - _cache[0]) < _CACHE_TTL:
+    cache_key = f"{'rich' if rich else 'compact'}_{days}"
+    if _cache[1] and (now - _cache[0]) < _CACHE_TTL and getattr(get_canvas_context, "_cache_key", "") == cache_key:
         return _cache[1]
 
     courses = _api_get("courses", {"enrollment_state": "active"})
     if not courses:
         return ""
+    if _ACTIVE_COURSE_IDS:
+        courses = [c for c in courses if c.get("id") in _ACTIVE_COURSE_IDS]
 
     cutoff = datetime.now(timezone.utc) + timedelta(days=days)
     all_assignments: list[dict] = []
@@ -174,13 +186,17 @@ def get_canvas_context(days: int | None = None) -> str:
             # Include if: overdue, or due within window, or no due date
             if due and due > cutoff:
                 continue
-            all_assignments.append({
+            entry = {
                 "course": cname,
                 "name": a.get("name", "Unnamed"),
                 "due": due,
                 "due_str": _format_due(due),
                 "points": a.get("points_possible", 0),
-            })
+            }
+            if rich:
+                desc = _html_to_md(a.get("description"))
+                entry["description"] = desc
+            all_assignments.append(entry)
 
     if not all_assignments:
         result = (
@@ -189,6 +205,7 @@ def get_canvas_context(days: int | None = None) -> str:
             "--- End Assignments ---"
         )
         _cache = (now, result)
+        get_canvas_context._cache_key = cache_key
         return result
 
     # Sort: overdue first, then by due date, no-date last
@@ -213,10 +230,18 @@ def get_canvas_context(days: int | None = None) -> str:
         lines.append(
             f"  {a['name']} | due: {a['due_str']} | {pts}{overdue}"
         )
+        if rich and a.get("description"):
+            # Include description indented under the assignment
+            desc_lines = a["description"].split("\n")
+            for dl in desc_lines[:30]:  # cap at 30 lines per assignment
+                lines.append(f"    {dl}")
+            if len(desc_lines) > 30:
+                lines.append(f"    ... ({len(desc_lines) - 30} more lines)")
 
     lines.append("--- End Assignments ---")
     result = "\n".join(lines)
     _cache = (now, result)
+    get_canvas_context._cache_key = cache_key
     return result
 
 
@@ -246,6 +271,8 @@ def sync_courses(vault_path: str | None = None) -> dict:
     })
     if not courses:
         return {"courses": [], "files_written": 0}
+    if _ACTIVE_COURSE_IDS:
+        courses = [c for c in courses if c.get("id") in _ACTIVE_COURSE_IDS]
 
     summary = {"courses": [], "files_written": 0}
     all_assignments_for_dashboard: list[dict] = []
@@ -510,15 +537,3 @@ def _write_dashboard(path: Path, assignments: list[dict]) -> None:
 
     path.write_text("\n".join(lines), encoding="utf-8")
 
-
-# ---------------------------------------------------------------------------
-# Public: course listing (debugging/REPL)
-# ---------------------------------------------------------------------------
-
-def list_courses() -> list[dict]:
-    """Return active courses with id and name."""
-    courses = _api_get("courses", {"enrollment_state": "active"})
-    return [
-        {"id": c.get("id"), "name": c.get("name", "Unknown")}
-        for c in courses
-    ]

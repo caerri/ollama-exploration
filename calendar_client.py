@@ -1,8 +1,7 @@
 """Read-only Apple Calendar access via macOS EventKit.
 
-Exports two functions:
+Exports:
   get_calendar_context(days)  — formatted text block of upcoming events
-  list_calendars()            — available calendars (for debugging)
 
 All EventKit/PyObjC code is isolated here. Nothing else in the project
 imports from PyObjC.
@@ -140,21 +139,3 @@ def get_calendar_context(days: int | None = None) -> str:
     result = "\n".join(lines)
     _cache = (now, result)
     return result
-
-
-def list_calendars() -> list[dict]:
-    """Return available calendars (name, id) for debugging."""
-    try:
-        from EventKit import EKEventStore, EKEntityTypeEvent
-    except ImportError:
-        return []
-
-    store = EKEventStore.alloc().init()
-    if not _request_access(store):
-        return []
-
-    cals = store.calendarsForEntityType_(EKEntityTypeEvent)
-    return [
-        {"name": str(c.title()), "id": str(c.calendarIdentifier())}
-        for c in cals
-    ]

@@ -9,17 +9,22 @@ from __future__ import annotations
 import json
 import sys
 import termios
+from datetime import datetime, timezone, timedelta
+
 import requests
 
 from config import (
     get_env,
-    DIM, BOLD, RESET, CYAN, GREEN, YELLOW, RED, MAGENTA, BLUE, LOCAL_COLOR,
+    DIM, BOLD, RESET, CYAN, GREEN, YELLOW, RED, MAGENTA,
     MODEL_MAP, MODEL_PROVIDER, COST_INFO, MODEL_SHORTCUTS, RESPONSES_API_MODELS,
-    CALENDAR_KEYWORDS, JOURNAL_KEYWORDS,
+    CALENDAR_KEYWORDS, JOURNAL_KEYWORDS, CANVAS_KEYWORDS, PLANNING_KEYWORDS,
+    STICKY_LOCAL_MAX,
 )
-from prompts import build_system_prompt, has_recent_context, REMOTE_SYSTEM_PROMPT
+from prompts import build_system_prompt, has_recent_context, REMOTE_SYSTEM_PROMPT, REMOTE_CONTEXT_PROMPT
+from render import render_response
 from calendar_client import get_calendar_context
 from obsidian_client import get_journal_context
+from canvas_client import get_canvas_context, sync_courses
 from conversation import (
     conversation_history, add_message, clear_history,
     build_conversation_digest, build_remote_messages,
@@ -30,6 +35,7 @@ from clients import (
     call_anthropic_stream, call_openai_stream, call_openai_responses_stream,
     unload_model,
 )
+from session_memory import load_session_summary, save_session_summary, forget_session
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +72,8 @@ def _check_expensive_model(model_choice: str, user_input: str,
 # ---------------------------------------------------------------------------
 # Core remote call — used by both relay_once() and direct @model triggers
 # ---------------------------------------------------------------------------
-def send_to_remote(user_input: str, model_choice: str) -> None:
+def send_to_remote(user_input: str, model_choice: str,
+                    remote_system_prompt: str | None = None) -> None:
     """Send the user's question + full conversation history to a remote model.
 
     This is the single path for ALL remote calls — whether triggered by llama's
@@ -75,26 +82,28 @@ def send_to_remote(user_input: str, model_choice: str) -> None:
     """
     model_id = MODEL_MAP.get(model_choice, MODEL_MAP["HAIKU"])
     provider = MODEL_PROVIDER.get(model_choice, "anthropic")
+    effective_system = remote_system_prompt or REMOTE_SYSTEM_PROMPT
 
     # Build multi-turn messages from real conversation history
     remote_messages = build_remote_messages(user_input)
 
     msg_count = len(remote_messages)
     total_chars = sum(len(m["content"]) for m in remote_messages)
+    sys_chars = len(effective_system)
     print(f"\n{MAGENTA}--- {model_id} (remote — {provider}) ---{RESET}")
-    print(f"{DIM}[Sending {msg_count} messages ({total_chars} chars) to {model_id}]{RESET}")
+    print(f"{DIM}[Sending {msg_count} messages ({total_chars} chars) + system ({sys_chars} chars) to {model_id}]{RESET}")
     print()
 
     if provider == "openai":
         if model_id in RESPONSES_API_MODELS:
             remote_response = call_openai_responses_stream(
-                model=model_id, messages=remote_messages, system_prompt=REMOTE_SYSTEM_PROMPT)
+                model=model_id, messages=remote_messages, system_prompt=effective_system)
         else:
             remote_response = call_openai_stream(
-                model=model_id, messages=remote_messages, system_prompt=REMOTE_SYSTEM_PROMPT)
+                model=model_id, messages=remote_messages, system_prompt=effective_system)
     else:
         remote_response = call_anthropic_stream(
-            model=model_id, messages=remote_messages, system_prompt=REMOTE_SYSTEM_PROMPT)
+            model=model_id, messages=remote_messages, system_prompt=effective_system)
 
     # Auto-escalate: if cheap model says it doesn't know, offer upgrade
     dont_know_phrases = [
@@ -116,13 +125,13 @@ def send_to_remote(user_input: str, model_choice: str) -> None:
             if provider == "openai":
                 if up_id in RESPONSES_API_MODELS:
                     remote_response = call_openai_responses_stream(
-                        model=up_id, messages=remote_messages, system_prompt=REMOTE_SYSTEM_PROMPT)
+                        model=up_id, messages=remote_messages, system_prompt=effective_system)
                 else:
                     remote_response = call_openai_stream(
-                        model=up_id, messages=remote_messages, system_prompt=REMOTE_SYSTEM_PROMPT)
+                        model=up_id, messages=remote_messages, system_prompt=effective_system)
             else:
                 remote_response = call_anthropic_stream(
-                    model=up_id, messages=remote_messages, system_prompt=REMOTE_SYSTEM_PROMPT)
+                    model=up_id, messages=remote_messages, system_prompt=effective_system)
             model_choice = up_model
         else:
             print(f"{DIM}[Keeping {model_choice} response]{RESET}")
@@ -136,11 +145,25 @@ def send_to_remote(user_input: str, model_choice: str) -> None:
 # ---------------------------------------------------------------------------
 def relay_once(user_input: str, force_remote: bool = False,
                force_model: str | None = None,
-               system_prompt: str | None = None) -> None:
-    """Main relay: run llama for routing, then dispatch accordingly."""
-    _local_model_name = get_env("OLLAMA_MODEL", "gemma2:9b")
-    print(f"\n{CYAN}--- {_local_model_name} (local) ---{RESET}")
-    local_raw = call_ollama(user_input, show_stream=True, system_prompt=system_prompt)
+               system_prompt: str | None = None,
+               context_model: str | None = None,
+               remote_system_prompt: str | None = None,
+               rich_context_input: str | None = None) -> None:
+    """Main relay: run llama for routing, then dispatch accordingly.
+
+    Pass context_model to auto-escalate to a stronger local model when
+    context data (calendar/journal/canvas) is injected.
+    Pass remote_system_prompt to give remote models the context analysis instructions.
+    Pass rich_context_input to send expanded context (full journal, assignment
+    descriptions) to remote models instead of the compact local version.
+    """
+    _local_model_name = context_model or get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+    label = f"{_local_model_name} (local)"
+    if context_model:
+        label = f"{_local_model_name} (local — context mode)"
+    print(f"\n{CYAN}--- {label} ---{RESET}")
+    local_raw = call_ollama(user_input, show_stream=True, system_prompt=system_prompt,
+                            model=context_model)
 
     try:
         parsed = parse_local_response(local_raw)
@@ -151,7 +174,8 @@ def relay_once(user_input: str, force_remote: bool = False,
                         f"Your previous answer was too long and got cut off. "
                         f"Give a SHORTER but still complete answer. "
                         f"Keep the output field under 1500 characters.")
-        retry_raw = call_ollama(retry_prompt, system_prompt=system_prompt)
+        retry_raw = call_ollama(retry_prompt, system_prompt=system_prompt,
+                               model=context_model)
         parsed = parse_local_response(retry_raw)
 
     # Python-side override: if the user is complaining about routing, force local
@@ -210,14 +234,12 @@ def relay_once(user_input: str, force_remote: bool = False,
             retry_raw = call_ollama(retry_prompt, system_prompt=system_prompt)
             retry_parsed = parse_local_response(retry_raw)
             output = retry_parsed["OUTPUT"]
-        local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
-        print(f"\n{DIM}[{local_model}]{RESET}")
-        print(f"{LOCAL_COLOR}{output}{RESET}")
+        print(f"\n{DIM}[{_local_model_name}]{RESET}")
+        render_response(output)
         return
 
     if next_step == "ASK_USER":
-        local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
-        print(f"\n{DIM}[{local_model}]{RESET}")
+        print(f"\n{DIM}[{_local_model_name}]{RESET}")
         print(f"{YELLOW}{parsed['OUTPUT']}{RESET}")
         return
 
@@ -242,6 +264,9 @@ def relay_once(user_input: str, force_remote: bool = False,
             choice = input(f"   > ").strip().lower()
 
             # Check if the user typed a model name to override
+            # Accept both "gpt_pro" and "@gpt_pro" syntax
+            if choice.startswith("@"):
+                choice = choice[1:]
             if choice in MODEL_SHORTCUTS:
                 override_model = MODEL_SHORTCUTS[choice]
                 override_model = _check_expensive_model(override_model, user_input, override_model)
@@ -286,15 +311,16 @@ def relay_once(user_input: str, force_remote: bool = False,
                                       f"You suggested sending this to the remote model, but the user "
                                       f"declined. Answer the question yourself to the best of your ability. "
                                       f"Set next_step to RESPOND_LOCALLY.")
-                _retry_model = get_env("OLLAMA_MODEL", "gemma2:9b")
+                _retry_model = context_model or get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
                 print(f"\n{CYAN}--- {_retry_model} (local retry) ---{RESET}")
                 retry_raw = call_ollama(local_retry_prompt, show_stream=True,
-                                       system_prompt=system_prompt)
+                                       system_prompt=system_prompt,
+                                       model=context_model)
                 try:
                     retry_parsed = parse_local_response(retry_raw)
-                    local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
+                    local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
                     print(f"\n{DIM}[{local_model}]{RESET}")
-                    print(f"{LOCAL_COLOR}{retry_parsed['OUTPUT']}{RESET}")
+                    render_response(retry_parsed['OUTPUT'])
                 except (ValueError, json.JSONDecodeError):
                     print(f"\n{YELLOW}[NOTE] Couldn't parse retry — here's the raw response{RESET}")
                     print(retry_raw)
@@ -307,7 +333,8 @@ def relay_once(user_input: str, force_remote: bool = False,
                                   f"more context first. Ask the user a clarifying question that would "
                                   f"help you either answer locally or build a better remote prompt. "
                                   f"Set next_step to ASK_USER.")
-                clarify_raw = call_ollama(clarify_prompt, system_prompt=system_prompt)
+                clarify_raw = call_ollama(clarify_prompt, system_prompt=system_prompt,
+                                         model=context_model)
                 try:
                     clarify_parsed = parse_local_response(clarify_raw)
                     print(f"\n{YELLOW}{clarify_parsed['OUTPUT']}{RESET}")
@@ -319,7 +346,9 @@ def relay_once(user_input: str, force_remote: bool = False,
                 print(f"{DIM}[Cancelled — press y to send]{RESET}")
                 return
 
-        send_to_remote(user_input, model_choice)
+        # Use rich context for remote calls when available
+        remote_input = rich_context_input if rich_context_input else user_input
+        send_to_remote(remote_input, model_choice, remote_system_prompt=remote_system_prompt)
         return
 
     print(f"\n{RED}[ERROR] Unexpected routing: {next_step}{RESET}")
@@ -329,7 +358,7 @@ def relay_once(user_input: str, force_remote: bool = False,
 # REPL — the user-facing loop
 # ---------------------------------------------------------------------------
 def main() -> None:
-    local_model = get_env("OLLAMA_MODEL", "gemma2:9b")
+    local_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
     escalation_model = get_env("OLLAMA_ESCALATION_MODEL", "")
 
     # Discover installed Ollama models and build @trigger shortcuts
@@ -348,7 +377,18 @@ def main() -> None:
     print(f"{DIM}  Local:     {local_triggers}{RESET}")
     print(f"{DIM}  Anthropic: @haiku  @sonnet  @opus{RESET}")
     print(f"{DIM}  OpenAI:    @mini   @gpt     @gpt_pro{RESET}")
-    print(f"{DIM}  Commands:  cal  journal  clear  exit{RESET}\n")
+    print(f"{DIM}  Commands:  cal  journal  canvas  sync  clear  /forget  exit{RESET}\n")
+
+    # --- Session memory: load previous session summary ---
+    session_summary = load_session_summary()
+    if session_summary:
+        print(f"{DIM}Last session loaded. /forget to start fresh.{RESET}\n")
+
+    # Sticky local model override — persists across loop iterations.
+    # When the user switches to a non-default local model via @mention,
+    # that model stays active for STICKY_LOCAL_MAX turns before reverting.
+    sticky_local_model: str | None = None
+    sticky_local_turns: int = 0
 
     while True:
         # Flush any leftover bytes in stdin (e.g. from a multi-line paste)
@@ -358,11 +398,16 @@ def main() -> None:
         if not user_input:
             continue
         if user_input.lower() in {"exit", "quit"}:
+            # Save session summary before exiting
+            if save_session_summary(conversation_history):
+                print(f"{DIM}[Session saved]{RESET}")
             print("Stopping relay.")
             unload_model()
             break
         if user_input.lower() == "clear":
             clear_history()
+            sticky_local_model = None
+            sticky_local_turns = 0
             print(f"{CYAN}[Conversation cleared]{RESET}")
             continue
         if user_input.lower() in {"cal", "calendar"}:
@@ -379,10 +424,32 @@ def main() -> None:
             else:
                 print(f"{YELLOW}[No journal entries found — check your vault's Journal/Daily/ folder]{RESET}")
             continue
+        if user_input.lower() in {"canvas", "assignments"}:
+            canvas_ctx = get_canvas_context()
+            if canvas_ctx:
+                print(f"\n{CYAN}{canvas_ctx}{RESET}")
+            else:
+                print(f"{YELLOW}[No Canvas data — check CANVAS_API_URL and CANVAS_API_TOKEN in .env]{RESET}")
+            continue
+        if user_input.lower() in {"/forget", "forget"}:
+            forget_session()
+            session_summary = ""
+            print(f"{CYAN}[Session memory cleared]{RESET}")
+            continue
+        if user_input.lower() == "sync":
+            print(f"{DIM}[Syncing Canvas courses to vault...]{RESET}")
+            result = sync_courses()
+            n = result.get("files_written", 0)
+            courses = result.get("courses", [])
+            for c in courses:
+                sections = ", ".join(c.get("sections", []))
+                print(f"{CYAN}  {c['name']}: {sections}{RESET}")
+            print(f"{GREEN}[Synced {n} files to vault]{RESET}")
+            continue
 
         # Detect explicit model triggers
         force_remote = False
-        force_local_model: str | None = None   # full Ollama model name (e.g. "mistral-nemo:12b")
+        force_local_model: str | None = None   # full Ollama model name (e.g. "qwen2.5:7b-instruct")
         force_model: str | None = None          # remote model canonical key (e.g. "HAIKU")
         lower_input = user_input.lower()
 
@@ -406,6 +473,17 @@ def main() -> None:
         if _local_matched and not force_local_model:
             continue  # empty usage — go back to prompt
 
+        # --- Sticky local model: update state on explicit @local trigger ---
+        default_model = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+        if force_local_model:
+            if force_local_model == default_model:
+                # Tagging the default model clears sticky override
+                sticky_local_model = None
+                sticky_local_turns = 0
+            else:
+                sticky_local_model = force_local_model
+                sticky_local_turns = STICKY_LOCAL_MAX
+
         # --- Check for @<remote-model> triggers (haiku, sonnet, gpt, etc.) ---
         if not force_local_model:
             if any(f"@{s}" in lower_input for s in MODEL_SHORTCUTS):
@@ -419,8 +497,15 @@ def main() -> None:
                         user_input = user_input[:lower_input.index(trigger)] + user_input[lower_input.index(trigger) + len(trigger):]
                         user_input = user_input.strip()
                         if not user_input:
-                            print(f"{YELLOW}Usage: {trigger} <your question>{RESET}")
-                            _matched_empty = True
+                            # No question provided — resend last substantive user message
+                            for msg in reversed(conversation_history):
+                                if msg["role"] == "user" and len(msg["content"]) >= 10:
+                                    user_input = msg["content"]
+                                    print(f"{DIM}[Resending: \"{user_input[:60]}{'...' if len(user_input) > 60 else ''}\"]{RESET}")
+                                    break
+                            if not user_input:
+                                print(f"{YELLOW}Usage: {trigger} <your question>{RESET}")
+                                _matched_empty = True
                         break
                 if _matched_empty:
                     continue
@@ -437,9 +522,28 @@ def main() -> None:
                 if not force_remote:
                     continue
 
+        # --- Sticky local model: apply when no explicit trigger this turn ---
+        if not force_local_model and not force_model and sticky_local_turns > 0:
+            force_local_model = sticky_local_model
+            sticky_local_turns -= 1
+            if sticky_local_turns == 0:
+                print(f"{DIM}[Sticky model expired — back to {default_model}]{RESET}")
+                sticky_local_model = None
+
+        # --- Session memory: inject previous session context (first turn only) ---
+        # After first turn, the summary is in conversation history and doesn't
+        # need re-injection.  Placed after keyword detection (which uses the
+        # original lower_input) so session text can't trigger false context matches.
+        if session_summary and not conversation_history:
+            _session_block = (
+                "--- Previous Session ---\n"
+                f"{session_summary}\n"
+                "--- End Previous Session ---"
+            )
+            user_input = _session_block + "\n\n" + user_input
+
         # --- Direct @<local-model>: skip routing, go straight to that Ollama model ---
         if force_local_model:
-            default_model = get_env("OLLAMA_MODEL", "gemma2:9b")
             if force_local_model == default_model:
                 # User tagged the default model — use call_ollama (JSON routing mode)
                 try:
@@ -447,7 +551,7 @@ def main() -> None:
                     local_raw = call_ollama(user_input, show_stream=True)
                     parsed = parse_local_response(local_raw)
                     print(f"\n{DIM}[{default_model}]{RESET}")
-                    print(f"{LOCAL_COLOR}{parsed['OUTPUT']}{RESET}")
+                    render_response(parsed['OUTPUT'])
                 except (ValueError, json.JSONDecodeError):
                     print(f"{YELLOW}[Couldn't parse response]{RESET}")
             else:
@@ -486,24 +590,112 @@ def main() -> None:
         # Sticky: if recent history already has context data, stay in context mode.
         cal_match = any(kw in lower_input for kw in CALENDAR_KEYWORDS)
         journal_match = any(kw in lower_input for kw in JOURNAL_KEYWORDS)
-        has_context = cal_match or journal_match or has_recent_context(conversation_history)
+        canvas_match = any(kw in lower_input for kw in CANVAS_KEYWORDS)
+        planning_match = any(kw in lower_input for kw in PLANNING_KEYWORDS)
+        sticky = has_recent_context(conversation_history)
+        has_context = cal_match or journal_match or canvas_match or planning_match or sticky
 
-        if cal_match or journal_match:
-            context_parts = []
+        # --- Routing trace ---
+        _triggers = []
+        if cal_match:
+            _kw = next(kw for kw in CALENDAR_KEYWORDS if kw in lower_input)
+            _triggers.append(f"cal(\"{_kw}\")")
+        if journal_match:
+            _kw = next(kw for kw in JOURNAL_KEYWORDS if kw in lower_input)
+            _triggers.append(f"journal(\"{_kw}\")")
+        if canvas_match:
+            _kw = next(kw for kw in CANVAS_KEYWORDS if kw in lower_input)
+            _triggers.append(f"canvas(\"{_kw}\")")
+        if planning_match:
+            _kw = next(kw for kw in PLANNING_KEYWORDS if kw in lower_input)
+            _triggers.append(f"planning(\"{_kw}\")")
+        if sticky:
+            _triggers.append("sticky(history)")
+        if _triggers:
+            fresh = cal_match or journal_match or canvas_match or planning_match
+            _dest = "haiku" if fresh else "local (sticky)"
+            print(f"{DIM}[route: {' + '.join(_triggers)} → {_dest}]{RESET}")
+
+        # Build context: compact version for local model, rich version for remote
+        _rich_context_input: str | None = None
+        if cal_match or journal_match or canvas_match or planning_match:
+            # Date/timezone header so remote models know when "today" is
+            _mst = timezone(timedelta(hours=-7))
+            _now = datetime.now(_mst)
+            _date_header = (
+                f"--- Today: {_now.strftime('%A, %B %-d, %Y at %-I:%M %p')} MST ---\n"
+                "All calendar times are in MST (Mountain Standard Time).\n"
+                "The user works a salaried office job, roughly 8 AM–5 PM weekdays. "
+                "Assume that block is unavailable for personal tasks."
+            )
+
+            # Compact context (for local 14b — limited context window)
+            context_parts = [_date_header]
             cal_ctx = get_calendar_context()
             if cal_ctx:
                 context_parts.append(cal_ctx)
             journal_ctx = get_journal_context()
             if journal_ctx:
                 context_parts.append(journal_ctx)
+            canvas_ctx = get_canvas_context()
+            if canvas_ctx:
+                context_parts.append(canvas_ctx)
             if context_parts:
+                _sources = []
+                if cal_ctx:
+                    _sources.append(f"cal({len(cal_ctx)}ch)")
+                if journal_ctx:
+                    _sources.append(f"journal({len(journal_ctx)}ch)")
+                if canvas_ctx:
+                    _sources.append(f"canvas({len(canvas_ctx)}ch)")
+                print(f"{DIM}[context: {' + '.join(_sources)} → {len(user_input) + sum(len(p) for p in context_parts)}ch total]{RESET}")
                 user_input = "\n\n".join(context_parts) + "\n\n" + user_input
 
-        system_prompt = build_system_prompt(has_context=has_context) if has_context else None
+            # Rich context (for remote models — full journal, assignment descriptions)
+            rich_parts = [_date_header]
+            if cal_ctx:
+                rich_parts.append(cal_ctx)  # calendar is already full detail
+            rich_journal = get_journal_context(rich=True)
+            if rich_journal:
+                rich_parts.append(rich_journal)
+            rich_canvas = get_canvas_context(rich=True)
+            if rich_canvas:
+                rich_parts.append(rich_canvas)
+            if rich_parts:
+                _original_question = user_input.split("\n\n")[-1]  # extract original question
+                _rich_context_input = "\n\n".join(rich_parts) + "\n\n" + _original_question
 
-        # --- Default path: llama routes ---
+        # --- Context routing: fresh keywords → Haiku (accurate date analysis) ---
+        fresh_context = cal_match or journal_match or canvas_match or planning_match
+        if fresh_context and not force_remote:
+            remote_input = _rich_context_input if _rich_context_input else user_input
+            cost = COST_INFO.get("HAIKU", "cheap")
+            print(f"{DIM}[model: → haiku ({cost}, context auto-route)]{RESET}")
+            add_message("user", user_input)
+            try:
+                send_to_remote(remote_input, "HAIKU",
+                               remote_system_prompt=REMOTE_CONTEXT_PROMPT)
+            except (requests.RequestException, ValueError) as err:
+                print(f"{RED}[ERROR] {err}{RESET}")
+            except Exception as err:  # noqa: BLE001
+                print(f"{RED}[UNEXPECTED ERROR] {err}{RESET}")
+            continue
+
+        # --- Sticky context: follow-ups stay on local escalation model ---
+        system_prompt = build_system_prompt(has_context=has_context) if has_context else None
+        _escalation = get_env("OLLAMA_ESCALATION_MODEL", "")
+        _context_model = _escalation if (sticky and _escalation) else None
+        _remote_prompt = REMOTE_CONTEXT_PROMPT if sticky else None
+        if _context_model:
+            _default = get_env("OLLAMA_MODEL", "qwen2.5:7b-instruct")
+            print(f"{DIM}[model: {_default} → {_context_model} (sticky escalation)]{RESET}")
+
+        # --- Default path: local model routes ---
         try:
-            relay_once(user_input, force_remote=force_remote, system_prompt=system_prompt)
+            relay_once(user_input, force_remote=force_remote,
+                       system_prompt=system_prompt, context_model=_context_model,
+                       remote_system_prompt=_remote_prompt,
+                       rich_context_input=_rich_context_input)
         except (requests.RequestException, ValueError) as err:
             print(f"{RED}[ERROR] {err}{RESET}")
         except Exception as err:  # noqa: BLE001
@@ -514,5 +706,9 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\nInterrupted. Unloading model...")
+        print("\nInterrupted.")
+        from conversation import conversation_history as _hist
+        if save_session_summary(_hist):
+            print(f"{DIM}[Session saved]{RESET}")
+        print("Unloading model...")
         unload_model()

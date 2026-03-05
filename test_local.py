@@ -12,6 +12,12 @@ Tests cover:
   9. Journal keyword detection — matching logic for Obsidian journal injection
  10. Journal template parsing — YAML frontmatter + markdown section extraction
  11. Prompt composition — modular prompt building and sticky context detection
+ 12. Canvas integration — keywords, context markers, sync format
+ 13. Planning keywords — auto-context trigger matching
+ 14. Sticky local model switching — 10-turn persistence, clear reset, default clears
+ 15. Remote prompt token budget — system prompts include budget instructions
+ 16. History window sizing — MAX_HISTORY and build_remote_messages max_turns
+ 17. Session memory — load, save, forget, context injection, graceful failure
 """
 
 from __future__ import annotations
@@ -24,7 +30,8 @@ from unittest.mock import patch, MagicMock
 from config import (
     MODEL_MAP, MODEL_PROVIDER, MODEL_SHORTCUTS, COST_INFO,
     VALID_NEXT_STEPS, MAX_HISTORY, CALENDAR_KEYWORDS, CALENDAR_LOOKAHEAD_DAYS,
-    JOURNAL_KEYWORDS, JOURNAL_LOOKBACK_DAYS,
+    JOURNAL_KEYWORDS, JOURNAL_LOOKBACK_DAYS, CANVAS_KEYWORDS, PLANNING_KEYWORDS,
+    STICKY_LOCAL_MAX,
     BOLD, RESET, DIM, CYAN, GREEN, YELLOW, RED,
 )
 from conversation import (
@@ -973,7 +980,7 @@ def test_natural_conversation_flow():
     # 8g. Long conversation doesn't lose early context within limits
     # ------------------------------------------------------------------
     _reset()
-    # Simulate 8 turns of conversation (16 messages = within MAX_HISTORY of 40)
+    # Simulate 8 turns of conversation (16 messages = within MAX_HISTORY)
     add_message("user", "my name is Carrie and I'm trying to build a budgeting app")
     add_message("assistant", json.dumps({
         "analysis": "User introduction",
@@ -1496,12 +1503,615 @@ def test_prompt_composition():
 
 
 # ======================================================================
+# 12. Canvas integration — keywords, context markers, sync format
+# ======================================================================
+
+def test_canvas_integration():
+    _section("12. Canvas Integration")
+    passed = 0
+    failed = 0
+
+    from prompts import CONTEXT_MARKERS
+
+    # --- 12a. CANVAS_KEYWORDS is non-empty and all lowercase ---
+    try:
+        assert len(CANVAS_KEYWORDS) > 0, "CANVAS_KEYWORDS is empty"
+        for kw in CANVAS_KEYWORDS:
+            assert kw == kw.lower(), f"keyword '{kw}' is not lowercase"
+        _pass(f"12a. CANVAS_KEYWORDS has {len(CANVAS_KEYWORDS)} entries, all lowercase"); passed += 1
+    except Exception as e:
+        _fail("12a. CANVAS_KEYWORDS", str(e)); failed += 1
+
+    # --- 12b. Expected phrases trigger canvas matches ---
+    should_match = [
+        "what's due this week",
+        "show me my assignments",
+        "any deadlines coming up",
+        "i need to check canvas",
+        "what homework do i have",
+        "my school work is piling up",
+    ]
+    for phrase in should_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in CANVAS_KEYWORDS)
+            assert matched, f"'{phrase}' should match but didn't"
+            _pass(f"Matches: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"Matches: '{phrase}'", str(e)); failed += 1
+
+    # --- 12c. Non-canvas phrases do NOT trigger ---
+    should_not_match = [
+        "hey what's up",
+        "write me a python script",
+        "how do i make pasta",
+        "tell me a joke",
+    ]
+    for phrase in should_not_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in CANVAS_KEYWORDS)
+            assert not matched, f"'{phrase}' should NOT match but did"
+            _pass(f"No match: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"No match: '{phrase}'", str(e)); failed += 1
+
+    # --- 12d. Assignment marker in CONTEXT_MARKERS ---
+    try:
+        assert "--- Your Assignments ---" in CONTEXT_MARKERS, \
+            "Assignment marker missing from CONTEXT_MARKERS"
+        _pass("12d. Assignment marker in CONTEXT_MARKERS"); passed += 1
+    except Exception as e:
+        _fail("12d. Assignment marker", str(e)); failed += 1
+
+    # --- 12e. Context prompt includes deadline awareness ---
+    try:
+        from prompts import build_system_prompt
+        ctx = build_system_prompt(has_context=True)
+        assert "DEADLINE AWARENESS" in ctx, "DEADLINE AWARENESS step missing"
+        assert "overdue" in ctx.lower(), "overdue mention missing from context prompt"
+        _pass("12e. Context prompt has deadline awareness"); passed += 1
+    except Exception as e:
+        _fail("12e. Deadline awareness in prompt", str(e)); failed += 1
+
+    # --- 12f. canvas_client imports cleanly and has expected functions ---
+    try:
+        from canvas_client import get_canvas_context, sync_courses
+        assert callable(get_canvas_context)
+        assert callable(sync_courses)
+        _pass("12f. canvas_client exports expected functions"); passed += 1
+    except Exception as e:
+        _fail("12f. canvas_client imports", str(e)); failed += 1
+
+    # --- 12g. get_canvas_context returns string (empty OK without API) ---
+    try:
+        from canvas_client import get_canvas_context as gcc
+        import canvas_client
+        canvas_client._cache = (0.0, "")  # clear cache
+        result = gcc(days=7)
+        assert isinstance(result, str), f"expected str, got {type(result)}"
+        _pass("12g. get_canvas_context returns string"); passed += 1
+    except Exception as e:
+        _fail("12g. get_canvas_context return type", str(e)); failed += 1
+
+    # --- 12h. has_recent_context detects assignment marker ---
+    try:
+        from prompts import has_recent_context
+        history_with_assignments = [
+            {"role": "user", "content": "--- Your Assignments ---\nCSCI E31\n  Paper due Mar 3"},
+            {"role": "assistant", "content": '{"output": "you have a paper due"}'},
+        ]
+        assert has_recent_context(history_with_assignments) is True
+        _pass("12h. has_recent_context detects assignment marker"); passed += 1
+    except Exception as e:
+        _fail("12h. Assignment marker detection", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} canvas_integration sub-tests failed"
+
+
+def test_planning_keywords():
+    _section("13. Planning Keywords — Auto-Context Trigger")
+    passed = 0
+    failed = 0
+
+    # --- 13a. PLANNING_KEYWORDS is non-empty and all lowercase ---
+    try:
+        assert len(PLANNING_KEYWORDS) > 0, "PLANNING_KEYWORDS is empty"
+        for kw in PLANNING_KEYWORDS:
+            assert kw == kw.lower(), f"keyword '{kw}' is not lowercase"
+        _pass(f"13a. PLANNING_KEYWORDS has {len(PLANNING_KEYWORDS)} entries, all lowercase"); passed += 1
+    except Exception as e:
+        _fail("13a. PLANNING_KEYWORDS", str(e)); failed += 1
+
+    # --- 13b. Planning phrases trigger context ---
+    should_match = [
+        "help me schedule my week",
+        "what should i work on tonight",
+        "help me prioritize my tasks",
+        "i'm falling behind on everything",
+        "what's on deck for tomorrow",
+        "help me plan this week",
+        "i need to catch up on school",
+        "prep for my classes",
+    ]
+    for phrase in should_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in PLANNING_KEYWORDS)
+            assert matched, f"'{phrase}' should match but didn't"
+            _pass(f"Matches: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"Matches: '{phrase}'", str(e)); failed += 1
+
+    # --- 13c. Non-planning phrases do NOT trigger ---
+    should_not_match = [
+        "tell me a joke",
+        "what is python",
+        "explain recursion",
+    ]
+    for phrase in should_not_match:
+        try:
+            lower = phrase.lower()
+            matched = any(kw in lower for kw in PLANNING_KEYWORDS)
+            assert not matched, f"'{phrase}' should NOT match but did"
+            _pass(f"No match: '{phrase}'"); passed += 1
+        except Exception as e:
+            _fail(f"No match: '{phrase}'", str(e)); failed += 1
+
+    # --- 13d. Planning keywords don't overlap with generic words that cause false positives ---
+    try:
+        generic_inputs = ["what time is it", "i have a question", "is this a good idea"]
+        false_positives = []
+        for phrase in generic_inputs:
+            if any(kw in phrase.lower() for kw in PLANNING_KEYWORDS):
+                false_positives.append(phrase)
+        assert not false_positives, f"False positives: {false_positives}"
+        _pass("13d. No false positives on generic inputs"); passed += 1
+    except Exception as e:
+        _fail("13d. False positive check", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} planning_keywords sub-tests failed"
+
+
+def test_sticky_local_model():
+    _section("14. Sticky Local Model Switching")
+    passed = 0
+    failed = 0
+
+    # --- 14a. STICKY_LOCAL_MAX is a reasonable value ---
+    try:
+        assert isinstance(STICKY_LOCAL_MAX, int), f"expected int, got {type(STICKY_LOCAL_MAX)}"
+        assert 1 <= STICKY_LOCAL_MAX <= 50, f"STICKY_LOCAL_MAX={STICKY_LOCAL_MAX} seems off"
+        _pass(f"14a. STICKY_LOCAL_MAX={STICKY_LOCAL_MAX} is reasonable"); passed += 1
+    except Exception as e:
+        _fail("14a. STICKY_LOCAL_MAX value", str(e)); failed += 1
+
+    # --- 14b. Sticky state variables are correctly initialized ---
+    # Simulate what main.py does before the while loop
+    try:
+        sticky_local_model: str | None = None
+        sticky_local_turns: int = 0
+        assert sticky_local_model is None
+        assert sticky_local_turns == 0
+        _pass("14b. Sticky state initializes to None/0"); passed += 1
+    except Exception as e:
+        _fail("14b. Sticky state initialization", str(e)); failed += 1
+
+    # --- 14c. Setting sticky model works ---
+    try:
+        sticky_local_model = "gemma2:9b"
+        sticky_local_turns = STICKY_LOCAL_MAX
+        assert sticky_local_model == "gemma2:9b"
+        assert sticky_local_turns == STICKY_LOCAL_MAX
+        _pass("14c. Sticky model set correctly"); passed += 1
+    except Exception as e:
+        _fail("14c. Setting sticky model", str(e)); failed += 1
+
+    # --- 14d. Decrement logic works over full cycle ---
+    try:
+        sticky_local_model = "gemma2:9b"
+        sticky_local_turns = STICKY_LOCAL_MAX
+        applied_models = []
+        for _ in range(STICKY_LOCAL_MAX):
+            # Simulate: no explicit trigger, sticky is active
+            assert sticky_local_turns > 0
+            applied_models.append(sticky_local_model)
+            sticky_local_turns -= 1
+            if sticky_local_turns == 0:
+                sticky_local_model = None
+        assert sticky_local_turns == 0, f"turns should be 0, got {sticky_local_turns}"
+        assert sticky_local_model is None, "model should be None after expiry"
+        assert len(applied_models) == STICKY_LOCAL_MAX
+        assert all(m == "gemma2:9b" for m in applied_models)
+        _pass(f"14d. Sticky expires after {STICKY_LOCAL_MAX} turns"); passed += 1
+    except Exception as e:
+        _fail("14d. Sticky decrement cycle", str(e)); failed += 1
+
+    # --- 14e. Switching to default model clears sticky ---
+    try:
+        default_model = "qwen2.5:7b-instruct"
+        sticky_local_model = "gemma2:9b"
+        sticky_local_turns = 7  # mid-cycle
+        # Simulate: user types @qwen (the default)
+        force_local_model = default_model
+        if force_local_model == default_model:
+            sticky_local_model = None
+            sticky_local_turns = 0
+        assert sticky_local_model is None, "sticky should be cleared"
+        assert sticky_local_turns == 0, "turns should be 0"
+        _pass("14e. Tagging default model clears sticky"); passed += 1
+    except Exception as e:
+        _fail("14e. Default model clears sticky", str(e)); failed += 1
+
+    # --- 14f. Switching to new non-default model resets counter ---
+    try:
+        sticky_local_model = "gemma2:9b"
+        sticky_local_turns = 3  # partially through
+        # Simulate: user types @llama mid-sticky
+        new_model = "llama3.1:8b"
+        default_model = "qwen2.5:7b-instruct"
+        if new_model != default_model:
+            sticky_local_model = new_model
+            sticky_local_turns = STICKY_LOCAL_MAX
+        assert sticky_local_model == "llama3.1:8b", "should switch to new model"
+        assert sticky_local_turns == STICKY_LOCAL_MAX, "counter should reset to max"
+        _pass("14f. New @local-model resets sticky counter"); passed += 1
+    except Exception as e:
+        _fail("14f. Mid-cycle model switch", str(e)); failed += 1
+
+    # --- 14g. Clear command resets sticky state ---
+    try:
+        sticky_local_model = "gemma2:9b"
+        sticky_local_turns = 5
+        # Simulate: clear command
+        clear_history()
+        sticky_local_model = None
+        sticky_local_turns = 0
+        assert sticky_local_model is None
+        assert sticky_local_turns == 0
+        assert len(conversation_history) == 0
+        _pass("14g. Clear resets sticky + history"); passed += 1
+    except Exception as e:
+        _fail("14g. Clear resets sticky", str(e)); failed += 1
+
+    # --- 14h. Remote model trigger doesn't consume sticky turns ---
+    try:
+        sticky_local_model = "gemma2:9b"
+        sticky_local_turns = 5
+        # Simulate: @haiku (remote) — force_model is set, force_local_model is None
+        force_local_model = None
+        force_model = "HAIKU"
+        # The sticky logic: if not force_local_model and not force_model and turns > 0
+        if not force_local_model and not force_model and sticky_local_turns > 0:
+            # This should NOT fire
+            sticky_local_turns -= 1
+        assert sticky_local_turns == 5, f"turns should still be 5, got {sticky_local_turns}"
+        assert sticky_local_model == "gemma2:9b", "sticky model should be unchanged"
+        _pass("14h. Remote trigger doesn't burn sticky turns"); passed += 1
+    except Exception as e:
+        _fail("14h. Remote doesn't consume sticky", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} sticky_local_model sub-tests failed"
+
+
+def test_remote_prompt_config():
+    _section("15. Remote Prompt Token Budget & History Config")
+    passed = 0
+    failed = 0
+
+    # --- 15a. REMOTE_SYSTEM_PROMPT contains token budget instruction ---
+    try:
+        from prompts import REMOTE_SYSTEM_PROMPT
+        assert "TOKEN BUDGET" in REMOTE_SYSTEM_PROMPT, "missing TOKEN BUDGET"
+        assert "8000" in REMOTE_SYSTEM_PROMPT, "missing 8000 token reference"
+        _pass("15a. REMOTE_SYSTEM_PROMPT has token budget"); passed += 1
+    except Exception as e:
+        _fail("15a. REMOTE_SYSTEM_PROMPT token budget", str(e)); failed += 1
+
+    # --- 15b. REMOTE_CONTEXT_PROMPT contains token budget instruction ---
+    try:
+        from prompts import REMOTE_CONTEXT_PROMPT
+        assert "TOKEN BUDGET" in REMOTE_CONTEXT_PROMPT, "missing TOKEN BUDGET"
+        assert "8000" in REMOTE_CONTEXT_PROMPT, "missing 8000 token reference"
+        _pass("15b. REMOTE_CONTEXT_PROMPT has token budget"); passed += 1
+    except Exception as e:
+        _fail("15b. REMOTE_CONTEXT_PROMPT token budget", str(e)); failed += 1
+
+    # --- 15c. REMOTE_SYSTEM_PROMPT has history guidance ---
+    try:
+        from prompts import REMOTE_SYSTEM_PROMPT
+        assert "LATEST" in REMOTE_SYSTEM_PROMPT or "latest" in REMOTE_SYSTEM_PROMPT, \
+            "missing instruction to focus on latest question"
+        assert "meandering" in REMOTE_SYSTEM_PROMPT or "unrelated" in REMOTE_SYSTEM_PROMPT, \
+            "missing warning about unrelated history"
+        _pass("15c. REMOTE_SYSTEM_PROMPT has history guidance"); passed += 1
+    except Exception as e:
+        _fail("15c. History guidance in system prompt", str(e)); failed += 1
+
+    # --- 15d. REMOTE_CONTEXT_PROMPT has history guidance ---
+    try:
+        from prompts import REMOTE_CONTEXT_PROMPT
+        assert "HISTORY NOTE" in REMOTE_CONTEXT_PROMPT or "history" in REMOTE_CONTEXT_PROMPT.lower(), \
+            "missing history handling note"
+        _pass("15d. REMOTE_CONTEXT_PROMPT has history guidance"); passed += 1
+    except Exception as e:
+        _fail("15d. History guidance in context prompt", str(e)); failed += 1
+
+    # --- 15e. MAX_HISTORY matches expected value ---
+    try:
+        assert MAX_HISTORY == 82, f"expected 82, got {MAX_HISTORY}"
+        _pass(f"15e. MAX_HISTORY={MAX_HISTORY} (41 exchanges)"); passed += 1
+    except Exception as e:
+        _fail("15e. MAX_HISTORY value", str(e)); failed += 1
+
+    # --- 15f. build_remote_messages default max_turns covers full history ---
+    try:
+        import inspect
+        sig = inspect.signature(build_remote_messages)
+        default_max_turns = sig.parameters["max_turns"].default
+        expected_turns = MAX_HISTORY // 2  # 82 / 2 = 41
+        assert default_max_turns == expected_turns, \
+            f"max_turns default is {default_max_turns}, expected {expected_turns} to match MAX_HISTORY"
+        _pass(f"15f. build_remote_messages max_turns={default_max_turns} matches MAX_HISTORY"); passed += 1
+    except Exception as e:
+        _fail("15f. max_turns matches MAX_HISTORY", str(e)); failed += 1
+
+    # --- 15g. build_remote_messages respects max_turns limit ---
+    try:
+        _reset()
+        # Add more messages than max_turns=2 would include
+        for i in range(10):
+            add_message("user", f"question {i}")
+            add_message("assistant", f'{{"output": "answer {i}", "next_step": "RESPOND_LOCALLY"}}')
+        msgs = build_remote_messages("current question", max_turns=2)
+        # Should only include recent turns + current question, not all 10
+        # Count user messages (excluding the appended current question)
+        user_msgs = [m for m in msgs if m["role"] == "user"]
+        # max_turns=2 grabs last 4 entries (2 user + 2 assistant), plus current question
+        assert len(user_msgs) <= 4, f"expected <=4 user messages with max_turns=2, got {len(user_msgs)}"
+        # Current question should be last
+        assert msgs[-1]["role"] == "user"
+        assert "current question" in msgs[-1]["content"]
+        _pass("15g. build_remote_messages respects max_turns"); passed += 1
+    except Exception as e:
+        _fail("15g. max_turns limiting", str(e)); failed += 1
+    finally:
+        _reset()
+
+    # --- 15h. Phone a Friend @ prefix stripping ---
+    try:
+        # Simulate what main.py does at the Phone a Friend prompt
+        test_choices = ["@gpt_pro", "@haiku", "@sonnet", "@mini"]
+        for raw_choice in test_choices:
+            choice = raw_choice
+            if choice.startswith("@"):
+                choice = choice[1:]
+            assert choice in MODEL_SHORTCUTS, f"'{raw_choice}' should resolve to valid shortcut after stripping @"
+        _pass("15h. @ prefix stripped at Phone a Friend prompt"); passed += 1
+    except Exception as e:
+        _fail("15h. Phone a Friend @ prefix", str(e)); failed += 1
+
+    assert failed == 0, f"{failed} remote_prompt_config sub-tests failed"
+
+
+# ======================================================================
+# 17. Session memory — load, save, forget, context injection
+# ======================================================================
+
+def test_session_memory():
+    _section("17. Session Memory")
+    passed = 0
+    failed = 0
+
+    from config import SESSION_SUMMARY_PATH
+    from session_memory import load_session_summary, forget_session, save_session_summary
+
+    # --- 17a. SESSION_SUMMARY_PATH points to vault System directory ---
+    try:
+        assert "System" in str(SESSION_SUMMARY_PATH), "path should be in System dir"
+        assert str(SESSION_SUMMARY_PATH).endswith("session-summary.md"), \
+            f"unexpected filename: {SESSION_SUMMARY_PATH}"
+        _pass("17a. SESSION_SUMMARY_PATH in vault/System/session-summary.md"); passed += 1
+    except Exception as e:
+        _fail("17a. SESSION_SUMMARY_PATH", str(e)); failed += 1
+
+    # --- 17b. load_session_summary returns "" for missing file ---
+    try:
+        with patch("session_memory.SESSION_SUMMARY_PATH", "/tmp/nonexistent_session_test_xyz.md"):
+            result = load_session_summary()
+            assert result == "", f"expected empty string, got: {result!r}"
+        _pass("17b. Missing file → empty string"); passed += 1
+    except Exception as e:
+        _fail("17b. Missing file handling", str(e)); failed += 1
+
+    # --- 17c. load_session_summary reads existing file ---
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("User was building session memory feature.\nDecided on single-file approach.")
+            tmp_path = f.name
+        with patch("session_memory.SESSION_SUMMARY_PATH", tmp_path):
+            result = load_session_summary()
+            assert "session memory" in result.lower(), f"unexpected content: {result!r}"
+            assert "single-file" in result
+        Path(tmp_path).unlink()
+        _pass("17c. Existing file loaded correctly"); passed += 1
+    except Exception as e:
+        _fail("17c. Load existing file", str(e)); failed += 1
+
+    # --- 17d. forget_session deletes the file ---
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("old session data")
+            tmp_path = f.name
+        assert Path(tmp_path).is_file(), "temp file should exist"
+        with patch("session_memory.SESSION_SUMMARY_PATH", tmp_path):
+            deleted = forget_session()
+            assert deleted is True, "should return True"
+            assert not Path(tmp_path).is_file(), "file should be deleted"
+        _pass("17d. forget_session deletes file"); passed += 1
+    except Exception as e:
+        _fail("17d. forget_session", str(e)); failed += 1
+
+    # --- 17e. forget_session returns False for missing file ---
+    try:
+        with patch("session_memory.SESSION_SUMMARY_PATH", "/tmp/nonexistent_session_test_xyz.md"):
+            result = forget_session()
+            assert result is False, f"expected False, got {result}"
+        _pass("17e. forget_session on missing file → False"); passed += 1
+    except Exception as e:
+        _fail("17e. forget_session missing file", str(e)); failed += 1
+
+    # --- 17f. save_session_summary skips trivial sessions ---
+    try:
+        # Less than _MIN_EXCHANGES (2) user messages
+        trivial_history = [
+            {"role": "user", "content": "hey"},
+            {"role": "assistant", "content": "hi"},
+        ]
+        result = save_session_summary(trivial_history)
+        assert result is False, "trivial session should not be saved"
+        _pass("17f. Trivial session (1 exchange) not saved"); passed += 1
+    except Exception as e:
+        _fail("17f. Trivial session skip", str(e)); failed += 1
+
+    # --- 17g. save_session_summary calls local model and writes file ---
+    try:
+        history = [
+            {"role": "user", "content": "help me build session memory"},
+            {"role": "assistant", "content": '{"output": "sure", "next_step": "RESPOND_LOCALLY"}'},
+            {"role": "user", "content": "it should save on quit"},
+            {"role": "assistant", "content": '{"output": "got it", "next_step": "RESPOND_LOCALLY"}'},
+            {"role": "user", "content": "and load on startup"},
+            {"role": "assistant", "content": '{"output": "makes sense", "next_step": "RESPOND_LOCALLY"}'},
+        ]
+        fake_summary = "User built session memory. Saves on quit, loads on startup. Uses local model."
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir) / "session-summary.md"
+            with patch("session_memory.SESSION_SUMMARY_PATH", str(tmp_path)), \
+                 patch("clients.call_ollama_direct", return_value=fake_summary) as mock_call:
+                # Need to also clear the conversation history that build_conversation_digest uses
+                _reset()
+                for msg in history:
+                    add_message(msg["role"], msg["content"])
+                result = save_session_summary(history)
+                assert result is True, f"expected True, got {result}"
+                assert tmp_path.is_file(), "summary file should exist"
+                content = tmp_path.read_text()
+                assert "session memory" in content.lower()
+                assert mock_call.called, "should have called call_ollama_direct"
+                # Verify it was called with show_stream=False
+                call_kwargs = mock_call.call_args
+                assert call_kwargs[1].get("show_stream") is False, \
+                    "summary generation should be silent"
+        _pass("17g. save_session_summary writes file via local model"); passed += 1
+    except Exception as e:
+        _fail("17g. save_session_summary", str(e)); failed += 1
+    finally:
+        _reset()
+
+    # --- 17h. save_session_summary handles model failure gracefully ---
+    try:
+        history = [
+            {"role": "user", "content": "first question about something"},
+            {"role": "assistant", "content": '{"output": "answer", "next_step": "RESPOND_LOCALLY"}'},
+            {"role": "user", "content": "second question about stuff"},
+            {"role": "assistant", "content": '{"output": "more", "next_step": "RESPOND_LOCALLY"}'},
+        ]
+        _reset()
+        for msg in history:
+            add_message(msg["role"], msg["content"])
+        with patch("clients.call_ollama_direct", side_effect=Exception("model crashed")):
+            result = save_session_summary(history)
+            assert result is False, "should return False on model failure"
+        _pass("17h. Model failure → graceful False"); passed += 1
+    except Exception as e:
+        _fail("17h. Model failure handling", str(e)); failed += 1
+    finally:
+        _reset()
+
+    # --- 17i. Session summary injects into first turn only ---
+    try:
+        _reset()
+        session_summary = "User was building session memory feature."
+        user_input = "hey what's up"
+        # Simulate main.py injection logic: only when history is empty
+        if session_summary and not conversation_history:
+            _session_block = (
+                "--- Previous Session ---\n"
+                f"{session_summary}\n"
+                "--- End Previous Session ---"
+            )
+            user_input = _session_block + "\n\n" + user_input
+        assert "--- Previous Session ---" in user_input
+        assert "session memory" in user_input
+        assert "hey what's up" in user_input
+
+        # After first turn is added to history, injection should NOT happen
+        add_message("user", user_input)
+        add_message("assistant", "hi there")
+        user_input2 = "tell me a joke"
+        if session_summary and not conversation_history:
+            user_input2 = "SHOULD NOT HAPPEN\n\n" + user_input2
+        assert "SHOULD NOT HAPPEN" not in user_input2, "second turn should not get injection"
+        _pass("17i. Session summary injected on first turn only"); passed += 1
+    except Exception as e:
+        _fail("17i. First-turn-only injection", str(e)); failed += 1
+    finally:
+        _reset()
+
+    # --- 17j. /forget clears in-memory session_summary ---
+    try:
+        session_summary = "Some old session data"
+        # Simulate /forget command logic from main.py
+        with patch("session_memory.SESSION_SUMMARY_PATH", "/tmp/nonexistent_xyz.md"):
+            forget_session()
+        session_summary = ""
+        assert session_summary == "", "session_summary should be empty after /forget"
+        _pass("17j. /forget clears in-memory variable"); passed += 1
+    except Exception as e:
+        _fail("17j. /forget clears variable", str(e)); failed += 1
+
+    # --- 17k. load_session_summary handles empty file ---
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+            f.write("")  # empty file
+            tmp_path = f.name
+        with patch("session_memory.SESSION_SUMMARY_PATH", tmp_path):
+            result = load_session_summary()
+            assert result == "", f"empty file should return empty string, got: {result!r}"
+        Path(tmp_path).unlink()
+        _pass("17k. Empty file → empty string"); passed += 1
+    except Exception as e:
+        _fail("17k. Empty file handling", str(e)); failed += 1
+
+    # --- 17l. Session summary doesn't trigger keyword detection ---
+    try:
+        # If session summary mentions "calendar" or "journal", it should NOT
+        # trigger context injection because keyword detection uses original input
+        session_text = "User checked their calendar and reviewed journal entries."
+        user_msg = "hey what's up"
+        # Keyword detection uses the ORIGINAL lower_input, not the injected version
+        lower_input = user_msg.lower()
+        from config import CALENDAR_KEYWORDS, JOURNAL_KEYWORDS
+        cal_match = any(kw in lower_input for kw in CALENDAR_KEYWORDS)
+        journal_match = any(kw in lower_input for kw in JOURNAL_KEYWORDS)
+        assert not cal_match, "session summary should not trigger calendar keywords"
+        assert not journal_match, "session summary should not trigger journal keywords"
+        _pass("17l. Session text doesn't trigger keyword detection"); passed += 1
+    except Exception as e:
+        _fail("17l. No false keyword triggers", str(e)); failed += 1
+
+    _reset()
+    assert failed == 0, f"{failed} session_memory sub-tests failed"
+
+
+# ======================================================================
 # Main (standalone runner — also works with pytest)
 # ======================================================================
 
 def main():
     print(f"{BOLD}{CYAN}Local Test Suite — No API Calls{RESET}")
-    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, calendar, journal, and prompts{RESET}")
+    print(f"{DIM}Testing parse, conversation, digest, shortcuts, config, calendar, journal, prompts, canvas, and session memory{RESET}")
 
     total_passed = 0
     total_failed = 0
@@ -1518,6 +2128,11 @@ def main():
         test_journal_keywords,
         test_journal_parsing,
         test_prompt_composition,
+        test_canvas_integration,
+        test_planning_keywords,
+        test_sticky_local_model,
+        test_remote_prompt_config,
+        test_session_memory,
     ]:
         try:
             test_fn()

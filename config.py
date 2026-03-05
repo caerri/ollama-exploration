@@ -25,7 +25,6 @@ YELLOW = "\033[33m"
 RED = "\033[31m"
 MAGENTA = "\033[35m"
 BLUE = "\033[38;5;111m"
-LOCAL_COLOR = "\033[38;5;252m"  # soft white — distinct from user text
 
 
 def get_env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -35,8 +34,12 @@ def get_env(name: str, default: str | None = None, required: bool = False) -> st
     return value or ""
 
 
-# Keep last 40 entries (~20 exchanges) so remote models see enough context
-MAX_HISTORY = 40
+# Keep last 82 entries (~41 exchanges) so remote models see full context
+MAX_HISTORY = 82
+
+# When user switches to a non-default local model via @mention,
+# stick with that model for this many turns before reverting to default.
+STICKY_LOCAL_MAX = 10
 
 # Calendar: how many days ahead to fetch events
 CALENDAR_LOOKAHEAD_DAYS = 7
@@ -52,6 +55,9 @@ CALENDAR_KEYWORDS = [
 # Obsidian journal settings
 OBSIDIAN_VAULT_PATH = get_env("OBSIDIAN_VAULT_PATH", "~/Documents/vault-zero")
 JOURNAL_LOOKBACK_DAYS = 7
+
+# Session memory — single file overwritten each session, deleted by /forget
+SESSION_SUMMARY_PATH = Path(OBSIDIAN_VAULT_PATH).expanduser() / "System" / "session-summary.md"
 
 # Keywords that trigger journal context injection
 JOURNAL_KEYWORDS = [
@@ -76,6 +82,24 @@ CANVAS_KEYWORDS = [
     "canvas", "assignment", "assignments", "due", "deadline",
     "deadlines", "homework", "what's due", "whats due",
     "school", "grades", "syllabus", "coursework",
+]
+
+# Planning / time-management keywords — trigger ALL context sources at once.
+# Any match here fires calendar + journal + canvas, same as matching any
+# individual keyword list above.  Kept separate so the intent is clear.
+PLANNING_KEYWORDS = [
+    "schedule", "plan my", "plan the", "plan this",
+    "organize my", "organize the", "prioritize",
+    "what should i", "what do i need", "what's on deck",
+    "whats on deck", "on deck", "on my plate", "triage",
+    "help me plan", "help me prioritize", "help me schedule",
+    "this week", "next week", "rest of my",
+    "tomorrow", "tonight", "time for",
+    "fit everything", "squeeze in", "make time",
+    "falling behind", "behind on", "catching up", "catch up",
+    "prep for", "prepare for", "get ready",
+    "overwhelmed", "swamped", "slammed", "stretched thin",
+    "how much time", "do i have time", "is there time",
 ]
 
 

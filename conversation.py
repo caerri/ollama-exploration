@@ -93,7 +93,7 @@ def build_conversation_digest(max_turns: int = 10) -> str:
     return "--- Conversation so far ---\n" + "\n".join(lines) + "\n--- End of conversation ---"
 
 
-def build_remote_messages(user_input: str, max_turns: int = 10) -> list[dict[str, str]]:
+def build_remote_messages(user_input: str, max_turns: int = 41) -> list[dict[str, str]]:
     """Build a proper multi-turn messages array for remote APIs.
 
     Sends real conversation history so the remote model sees the full picture:

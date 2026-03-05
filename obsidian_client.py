@@ -99,6 +99,12 @@ def _format_plan_inline(plan_text: str) -> str:
     return ", ".join(items) if items else plan_text[:_SECTION_MAX_CHARS]
 
 
+def _indent(text: str, spaces: int = 4) -> str:
+    """Indent each line of text by N spaces."""
+    prefix = " " * spaces
+    return "\n".join(prefix + line for line in text.split("\n"))
+
+
 def _truncate(text: str, max_chars: int = _SECTION_MAX_CHARS) -> str:
     """Truncate text to max_chars, adding ... if cut off."""
     # Collapse to single line for compact display
@@ -108,15 +114,14 @@ def _truncate(text: str, max_chars: int = _SECTION_MAX_CHARS) -> str:
     return single[:max_chars].rstrip() + "..."
 
 
-def _format_entry(entry: dict) -> str:
-    """Format a single day's parsed note into a compact text block.
+def _format_entry(entry: dict, rich: bool = False) -> str:
+    """Format a single day's parsed note into a text block.
 
-    Example output:
-        Sat Feb 22 (mood:4 energy:3 sleep:7h):
-          Plan: [x] study math, [ ] gym, [x] code
-          Happened: Mostly coding today. Got journal working.
-          Wins: Journal integration shipped
-          Blockers: Didn't start studying
+    If rich=False (default), sections are truncated to _SECTION_MAX_CHARS
+    for local model context windows.
+
+    If rich=True, full section content is preserved for remote models
+    that can handle large context.
     """
     # Parse the date for a friendly header
     try:
@@ -149,11 +154,14 @@ def _format_entry(entry: dict) -> str:
     lines = [header]
     sections = entry.get("sections", {})
 
-    # Plan gets special inline formatting
+    # Plan gets special inline formatting (compact) or full checklist (rich)
     if "Plan" in sections:
-        lines.append(f"  Plan: {_format_plan_inline(sections['Plan'])}")
+        if rich:
+            lines.append(f"  Plan:\n{_indent(sections['Plan'], 4)}")
+        else:
+            lines.append(f"  Plan: {_format_plan_inline(sections['Plan'])}")
 
-    # Other sections get truncated
+    # Other sections: full content (rich) or truncated (compact)
     section_map = [
         ("What Happened", "Happened"),
         ("Wins", "Wins"),
@@ -162,7 +170,10 @@ def _format_entry(entry: dict) -> str:
     ]
     for full_name, short_name in section_map:
         if full_name in sections:
-            lines.append(f"  {short_name}: {_truncate(sections[full_name])}")
+            if rich:
+                lines.append(f"  {short_name}:\n{_indent(sections[full_name], 4)}")
+            else:
+                lines.append(f"  {short_name}: {_truncate(sections[full_name])}")
 
     return "\n".join(lines)
 
@@ -206,18 +217,27 @@ def get_recent_entries(days: int | None = None,
 
 
 def get_journal_context(days: int | None = None,
-                        vault_path: str | None = None) -> str:
+                        vault_path: str | None = None,
+                        rich: bool = False) -> str:
     """Fetch recent journal entries and return a formatted text block.
 
+    If rich=False (default), returns compact format for local models.
+    If rich=True, returns full untruncated entries over a longer window
+    for remote models that can analyze trends.
+
     Returns empty string if vault not found, journal dir missing, or no entries.
-    Results are cached for 5 minutes.
+    Results are cached for 5 minutes (compact and rich cached separately).
     """
     if days is None:
         days = int(get_env("JOURNAL_LOOKBACK_DAYS", "7"))
+        if rich:
+            days = max(days, 30)  # at least 30 days for trend detection
 
+    cache_key = f"{'rich' if rich else 'compact'}_{days}"
     global _cache
     now = time.time()
-    if _cache[1] and (now - _cache[0]) < _CACHE_TTL:
+    # Simple cache — only reuse if same mode
+    if _cache[1] and (now - _cache[0]) < _CACHE_TTL and getattr(get_journal_context, "_cache_key", "") == cache_key:
         return _cache[1]
 
     entries = get_recent_entries(days, vault_path)
@@ -232,12 +252,15 @@ def get_journal_context(days: int | None = None,
             f"--- End Journal ---"
         )
         _cache = (now, result)
+        get_journal_context._cache_key = cache_key
         return result
 
     lines = [f"--- Your Journal (last {days} days) ---"]
 
     for entry in entries:
         if entry.get("missing"):
+            if rich:
+                continue  # skip missing days in rich mode to reduce noise
             # Show the date but note no entry
             try:
                 dt = datetime.strptime(entry["date"], "%Y-%m-%d")
@@ -253,9 +276,10 @@ def get_journal_context(days: int | None = None,
             lines.append(f"{header}:")
             lines.append("  (no entry)")
         else:
-            lines.append(_format_entry(entry))
+            lines.append(_format_entry(entry, rich=rich))
 
     lines.append("--- End Journal ---")
     result = "\n".join(lines)
     _cache = (now, result)
+    get_journal_context._cache_key = cache_key
     return result
